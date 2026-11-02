@@ -91,8 +91,21 @@ sudo apt-get install -y clang llvm bpftool libbpf-dev libssl-dev \
 make
 ```
 
-构建时会用目标机器的 BTF 生成 `src/vmlinux.h`，因此在哪台机器运行就在哪台机器编译。
-产物是 `./mtls_shield`。
+默认会用**构建机**的 BTF 生成 `src/vmlinux.h`。但 `vmlinux.h` 只是编译期的类型来源，
+加载时 libbpf 会用目标内核的 BTF 做 CO-RE 重定位，所以 BPF 对象是可移植的：
+**用目标机器的 `vmlinux.h` 编译，产物就能在目标机器运行**，不要求一定在目标机器上编译。
+
+交叉编译时，先取目标内核的 BTF 覆盖 `src/vmlinux.h`：
+
+```bash
+bpftool btf dump file /sys/kernel/btf/vmlinux format c > src/vmlinux.h
+```
+
+（在目标机器上执行，或取得目标机的 `/sys/kernel/btf/vmlinux` 后在构建机执行。）
+
+注意 BPF 对象和用户态程序要分开看：BPF 对象靠 CO-RE 跨内核版本，但用户态
+`mtls_shield` 链接的是 libc/libbpf/libssl，必须针对目标架构和库编译，交叉编译需要
+对应的工具链。另外 BPF 的 `-D__TARGET_ARCH_*` 仍应与目标架构一致。产物是 `./mtls_shield`。
 
 ## 生成证书
 

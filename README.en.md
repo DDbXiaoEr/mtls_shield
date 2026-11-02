@@ -100,8 +100,25 @@ sudo apt-get install -y clang llvm bpftool libbpf-dev libssl-dev \
 make
 ```
 
-The build uses the target machine's BTF to generate `src/vmlinux.h`, so build on the machine
-where you will run it. The output is `./mtls_shield`.
+By default the build uses the **build machine's** BTF to generate `src/vmlinux.h`. But
+`vmlinux.h` is only a compile-time source of types: at load time libbpf performs CO-RE
+relocations against the target kernel's BTF, so the BPF object is portable.
+**Compiling against the target machine's `vmlinux.h` is enough for the result to run on that
+target**; you are not required to build on the target itself.
+
+For cross-compilation, overwrite `src/vmlinux.h` with the target kernel's BTF first:
+
+```bash
+bpftool btf dump file /sys/kernel/btf/vmlinux format c > src/vmlinux.h
+```
+
+(Run this on the target, or copy the target's `/sys/kernel/btf/vmlinux` to the build machine.)
+
+Note that the BPF object and the user-space program are different: the BPF object travels
+across kernel versions via CO-RE, but the `mtls_shield` user-space binary links
+libc/libbpf/libssl and must be built for the target architecture and libraries; cross
+compilation needs the matching toolchain. Also keep `-D__TARGET_ARCH_*` consistent with the
+target architecture. The output is `./mtls_shield`.
 
 ## Generate certificates
 
