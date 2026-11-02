@@ -66,6 +66,18 @@ TLS 握手和证书校验必须在用户态完成，eBPF 不适合在核内做�
 - `clang`、`bpftool`、`libbpf-dev`、`libssl-dev`、`pkg-config`、`curl`
 - 目标内核有 `/sys/kernel/btf/vmlinux`（Ubuntu/Debian 默认有）
 
+### 为什么必须 >= 5.9
+
+- `sk_lookup` 程序类型和 `bpf_sk_assign()` 辅助函数都是 **Linux 5.9 才引入**的
+  （见 `src/mtls_shield.bpf.c`）。
+- skeleton 会**无条件加载所有 BPF 程序**，即使同端口模式不使用 redirect，低于 5.9 的内核
+  也会在加载阶段直接失败。
+- 同端口模式本身只依赖 `cgroup/bind4`（4.17+），理论上可支持 4.18/5.x：用
+  `bpf_program__set_autoload()` 按模式跳过 `sk_lookup`/`connect4`，或把两种模式拆成独立
+  对象即可。
+- 实际不建议低于 5.2：项目依赖内核 BTF（`/sys/kernel/btf/vmlinux`）生成 `vmlinux.h`，
+  CO-RE 也需要它。生产环境推荐 5.10 LTS。
+
 Ubuntu 安装依赖：
 
 ```bash

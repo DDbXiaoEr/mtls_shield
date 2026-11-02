@@ -74,6 +74,19 @@ configuration does not use this mode.
 - `clang`, `bpftool`, `libbpf-dev`, `libssl-dev`, `pkg-config`, `curl`
 - `/sys/kernel/btf/vmlinux` available on the target kernel (present by default on Ubuntu/Debian)
 
+### Why >= 5.9 is required
+
+- The `sk_lookup` program type and the `bpf_sk_assign()` helper were both introduced in
+  **Linux 5.9** (see `src/mtls_shield.bpf.c`).
+- The skeleton **loads all BPF programs unconditionally**, so even in same-port mode (which
+  does not use redirect) a kernel below 5.9 fails directly at the load stage.
+- Same-port mode itself only depends on `cgroup/bind4` (4.17+), so 4.18/5.x could work in
+  theory: use `bpf_program__set_autoload()` to skip `sk_lookup`/`connect4` per mode, or split
+  the two modes into separate objects.
+- Going below 5.2 is not recommended in practice: the project relies on kernel BTF
+  (`/sys/kernel/btf/vmlinux`) to generate `vmlinux.h`, and CO-RE needs it too. 5.10 LTS is
+  recommended for production.
+
 Install dependencies on Ubuntu:
 
 ```bash
