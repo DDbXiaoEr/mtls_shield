@@ -1,0 +1,259 @@
+# mtls_shield
+
+[English](README.en.md) | 中文
+
+用 eBPF 在一个普通 TCP 服务的**原端口**上直接加上 mTLS，服务端代码和启动参数都不用改。
+
+```
+客户端 ──TLS:9000──▶ mtls_shield（监听原端口，OpenSSL mTLS 终结）
+                              │
+                              └──明文 TCP:19000──▶ 原来的普通服务
+```
+
+关键点是：原端口 9000 由 `mtls_shield` 直接监听，没有额外的 TLS 代理端口。
+后端服务的 `bind(9000)` 由 eBPF `cgroup/bind4` 在系统调用层透明改写为
+`127.0.0.1:19000`，所以后端仍然以为自己在监听 9000，代码和配置都不需要改。
+
+## 设计思路
+
+TLS 握手和证书校验必须在用户态完成，eBPF 不适合在核内做密码学。这里的职责划分是：
+
+1. **eBPF `cgroup/bind4`**：后端进程调用 `bind(..., 9000)` 时，把端口改写为内部端口
+   `19000`，并把监听地址限定到回环地址。后端进程完全无感知。
+2. **`mtls_shield` 监听原端口 9000**：直接接受客户端的 TLS 连接，强制校验客户端证书。
+3. **明文转发**：TLS 解密后的数据通过 `127.0.0.1:19000` 发给原服务。
+
+客户端看到的始终只有 9000，没有第二个代理端口。
+
+### 为什么后端一定有一个内部端口
+
+同一个 IP/端口不能让两个进程同时监听。要在 9000 上做 TLS 终结，就必须由
+`mtls_shield` 占用 9000，原来的明文服务只能退到别处。eBPF `bind4` 的价值是：
+
+- 不用改服务代码；
+- 不用改服务的监听端口配置；
+- 内部端口只绑定在回环地址，不对外暴露。
+
+如果服务本身能改成 Unix socket，也可以把内部通道换成 Unix socket，但这需要改服务。
+
+### 可选的 redirect 模式
+
+如果 `--listen` 指定的端口和 `--protect-port` 不同，程序会自动使用旧的重定向模式：
+`mtls_shield` 监听另一个端口，eBPF `sk_lookup` + `cgroup/connect4` 把原端口的连接
+透明重定向过去。默认配置不使用这个模式。
+
+## 目录结构
+
+```
+.
+├── Makefile
+├── README.md
+├── src
+│   ├── mtls_shield.bpf.c   eBPF：cgroup/bind4（同端口模式）+ sk_lookup/connect4（redirect 模式）
+│   └── mtls_shield.c       用户态：加载 eBPF、TLS 监听、mTLS 校验、双向转发
+└── scripts
+    ├── gen_certs.sh        生成 CA / 服务端证书 / 客户端证书 / 恶意测试证书
+    ├── demo_backend.py     普通明文 HTTP 后端
+    └── demo.sh             一键构建 + 启动 + 端到端测试
+```
+
+## 环境要求
+
+- Linux 内核 >= 5.9，且启用 `CONFIG_BPF_SYSCALL`、`CONFIG_INET`、
+  `CONFIG_CGROUP_BPF`
+- cgroup v2
+- root 权限（`CAP_BPF` + `CAP_NET_ADMIN`）
+- `clang`、`bpftool`、`libbpf-dev`、`libssl-dev`、`pkg-config`、`curl`
+- 目标内核有 `/sys/kernel/btf/vmlinux`（Ubuntu/Debian 默认有）
+
+Ubuntu 安装依赖：
+
+```bash
+sudo apt-get install -y clang llvm bpftool libbpf-dev libssl-dev \
+    pkg-config make gcc iproute2 curl
+```
+
+## 构建
+
+```bash
+make
+```
+
+构建时会用目标机器的 BTF 生成 `src/vmlinux.h`，因此在哪台机器运行就在哪台机器编译。
+产物是 `./mtls_shield`。
+
+## 生成证书
+
+```bash
+HOST_IP=172.16.74.195 ./scripts/gen_certs.sh certs
+```
+
+`HOST_IP` 会写进服务端证书的 SAN。证书包括：
+
+- `ca.crt` / `ca.key`：信任的 CA
+- `server.crt` / `server.key`：服务端证书
+- `client.crt` / `client.key`：合法客户端证书（CN=alice）
+- `rogue-ca.*` / `rogue-client.*`：不受信任的客户端证书，用于负向测试
+
+## 运行
+
+**顺序很重要：先启动 `mtls_shield`，再启动原来的服务。** 因为 eBPF 必须赶在服务
+`bind(9000)` 之前挂上，才能改写它的监听端口。
+
+1. 启动 mTLS 层，占用原端口 9000：
+
+```bash
+sudo ./mtls_shield \
+  --listen 0.0.0.0:9000 \
+  --protect-port 9000 \
+  --upstream 127.0.0.1:19000 \
+  --ca certs/ca.crt \
+  --cert certs/server.crt \
+  --key certs/server.key
+```
+
+默认**不限制 CN**：只要客户端证书能链到 `--ca` 指定的 CA，并且证书在有效期内，
+任何 CN 都会被接受。只有显式传入 `--allow-cn` 才会启用 CN 白名单。
+上面的命令如果加 `--allow-cn alice`，就只允许 CN=alice。
+
+2. 再启动原来的服务。它仍然按原配置监听 9000：
+
+```bash
+python3 scripts/demo_backend.py --host 127.0.0.1 --port 9000
+```
+
+eBPF 会把它实际的监听地址改成 `127.0.0.1:19000`。可以验证：
+
+```bash
+ss -ltnp | grep -E ':(9000|19000)'
+# mtls_shield 监听 0.0.0.0:9000
+# python3     监听 127.0.0.1:19000
+```
+
+3. 客户端仍然访问 9000，但实际是 mTLS：
+
+```bash
+curl --cacert certs/ca.crt \
+     --cert certs/client.crt \
+     --key certs/client.key \
+     https://172.16.74.195:9000/
+```
+
+不带客户端证书：
+
+```bash
+curl --cacert certs/ca.crt https://172.16.74.195:9000/
+# 握手失败
+```
+
+直接用明文访问原端口：
+
+```bash
+curl http://172.16.74.195:9000/
+# 握手失败
+```
+
+内部后端仍然是明文：
+
+```bash
+curl http://127.0.0.1:19000/
+# 200，证明原服务没有改动
+```
+
+### 一键演示
+
+脚本会构建、生成证书、**先启动 shield 再启动后端**，并验证：
+
+- eBPF 把后端的 bind 从 9000 改写到 19000
+- 原端口上的 mTLS 成功
+- 无客户端证书、非信任 CA、明文 HTTP 被拒绝
+- 1 MiB 响应和 256 KiB 请求的转发
+- 从独立 netns 模拟远端客户端访问原端口
+
+```bash
+sudo ./scripts/demo.sh
+```
+
+## 参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `-l, --listen ADDR:PORT` | `0.0.0.0:9000` | mTLS 监听地址；和 `--protect-port` 相同即同端口模式 |
+| `-p, --protect-port PORT` | `9000` | 原始 TCP 端口 |
+| `-u, --upstream ADDR:PORT` | `127.0.0.1:19000` | 内部明文服务地址，也是 bind 改写目标 |
+| `-n, --protect-cidr CIDR` | 所有本机 IPv4 地址 | 仅 redirect 模式使用 |
+| `-a, --ca FILE` | `certs/ca.crt` | 客户端证书 CA |
+| `-c, --cert FILE` | `certs/server.crt` | 服务端证书链 |
+| `-k, --key FILE` | `certs/server.key` | 服务端私钥 |
+| `-C, --allow-cn CN` | 不限制 | 允许的客户端证书 CN，可重复 |
+| `-t, --handshake-timeout SEC` | `10` | TLS 握手超时 |
+| `-m, --max-conns N` | `512` | 最大并发连接数 |
+| `-L, --no-local-redirect` | 关闭该开关 | redirect 模式下不挂 `cgroup/connect4` |
+| `-v, --verbose` | 关闭 | 打印 libbpf 调试日志 |
+| `-h, --help` | | 帮助 |
+
+启动后给进程发 `SIGUSR1` 可以打印 BPF 统计：
+
+```bash
+sudo kill -USR1 <pid>
+```
+
+统计项：
+
+- `bind_redirect`：同端口模式下，被改写的后端 `bind()` 次数
+- `sk_lookup_redirect` / `connect_redirect`：redirect 模式下的重定向次数
+- `no_proxy_socket` / `assign_error`：redirect 模式的异常计数
+- `sk_lookup_seen` / `port_match`：调试计数
+
+## 安全说明
+
+- 只接受 TLS 1.2 及以上。
+- 必须提供客户端证书（`SSL_VERIFY_FAIL_IF_NO_PEER_CERT`）。
+- 客户端证书必须能链到 `--ca` 指定的 CA。
+- 可选 `--allow-cn` 做第二层身份白名单。
+- 明文客户端会直接握手失败，无法绕过 mTLS。
+- eBPF 把后端监听地址强制改写到回环地址，外部无法直接访问明文后端。
+- 代理日志会记录客户端地址和证书 CN，但不会记录私钥或明文应用数据。
+
+## 限制
+
+- 目前只处理 IPv4；IPv6 需要增加 `cgroup/bind6` 和 IPv6 map/program。
+- 必须先启动 shield，再启动服务。服务启动后再挂 eBPF 无法追改已经完成的 `bind()`。
+- 后端服务的 `getsockname()` 会看到真实内部端口 19000；如果服务会把监听端口
+  写进响应或做自连接，需要注意。
+- `cgroup/bind4` 挂在 `/sys/fs/cgroup`，会改写所有后续对原端口的 `bind()`。
+  生产环境建议把后端放进独立 cgroup，并把程序挂到该 cgroup 上。
+- mTLS 在代理处终结，代理到后端是回环明文。
+- 没有实现 SNI 路由、TLS 透传、CRL/OCSP。
+- 每个连接一个线程，适合演示和中小流量；高并发场景应改成事件驱动或连接池。
+- redirect 模式仍然保留，但默认不使用。
+
+## 排障
+
+```bash
+# 确认 bind4 / sk_lookup 已加载
+sudo bpftool link list
+sudo bpftool prog show name shield_bind4
+
+# 查看监听：9000 应该是 mtls_shield，19000 应该是原服务
+ss -ltnp | grep -E ':(9000|19000)'
+
+# 查看代理日志
+tail -f demo.log
+```
+
+常见问题：
+
+- **启动报 `bind 0.0.0.0:9000: Address already in use`**：后端先启动了。
+  先停后端，启动 `mtls_shield`，再启动后端。程序日志里也会给出这个提示。
+- **后端还在 9000**：确认 `ss` 显示后端在 19000；如果不在，说明 `bind4` 没挂上，
+  或后端启动早于 shield。
+- **curl 报证书主机名不匹配**：生成证书时 `HOST_IP` 没包含访问用的 IP。
+- **远端访问不到**：确认 `--listen 0.0.0.0:9000`，防火墙放行 9000。
+- **`--allow-cn` 不生效**：确认证书的 Subject CN 就是配置的值。
+- **端口/资源残留**：进程退出时会 detach eBPF link；`bpftool link list` 里不应再有
+  对应的 `bind4`/`sk_lookup`。
+
+## 许可证
+
+本项目基于 [WTFPL](LICENSE)（Do What The Fuck You Want To Public License）发布。
