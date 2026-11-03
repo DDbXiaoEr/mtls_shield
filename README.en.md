@@ -269,6 +269,7 @@ sudo ./scripts/demo.sh
 | `-C, --allow-cn CN` | unrestricted | allowed client certificate CN, repeatable |
 | `-t, --handshake-timeout SEC` | `10` | TLS handshake timeout |
 | `-m, --max-conns N` | `512` | maximum concurrent connections |
+| `-P, --pool-size N` | `32` | pre-connected upstream pool size; `0` disables |
 | `-L, --no-local-redirect` | off | do not attach `cgroup/connect4` in redirect mode |
 | `-v, --verbose` | off | print libbpf debug logs |
 | `-h, --help` | | help |
@@ -285,6 +286,27 @@ Statistics:
 - `sk_lookup_redirect` / `connect_redirect`: redirect counts in redirect mode
 - `no_proxy_socket` / `assign_error`: error counters in redirect mode
 - `sk_lookup_seen` / `port_match`: debug counters
+- upstream pool: pool `hits` / `misses`
+
+## Upstream connection pool
+
+`src/mtls_shield.c` keeps a pool of pre-connected sockets to `--upstream`. A
+background thread replenishes the pool up to `--pool-size`; after a client
+finishes the mTLS handshake it takes a ready socket from the pool, avoiding the
+`socket()/connect()/poll()` round trip. If the pool is empty it falls back to a
+synchronous connect, so the pool size does not cap concurrency. Each socket is
+checked with `MSG_PEEK` before use and discarded if the backend closed or reset
+it. Sockets are closed when the session ends and never shared between clients,
+which keeps the proxy safe for arbitrary TCP protocols.
+
+For high concurrency:
+
+- Set `--pool-size` to the expected burst of new backend connections; 32–256 is
+  usually enough. A larger pool consumes backend accept-queue and connection
+  resources.
+- The pool removes upstream connect latency only; the proxy still uses one
+  thread per connection. For tens of thousands of connections, move to an
+  epoll event loop plus a thread pool.
 
 ## Security notes
 
@@ -304,7 +326,7 @@ Statistics:
 - `cgroup/bind4` is attached to `/sys/fs/cgroup` and rewrites every subsequent `bind()` on the original port. In production, put the backend in its own cgroup and attach the program to that cgroup.
 - mTLS terminates at the proxy; the proxy-to-backend hop is plaintext over loopback.
 - No SNI routing, TLS passthrough, or CRL/OCSP.
-- One thread per connection, suitable for demos and moderate traffic; high-concurrency workloads should use an event-driven model or a connection pool.
+- One thread per connection; the upstream pool reduces connect overhead but does not change the threading model. For tens of thousands of connections, use an epoll event loop plus a thread pool.
 - Redirect mode is still supported but not used by default.
 
 ## Troubleshooting

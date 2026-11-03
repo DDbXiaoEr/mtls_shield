@@ -52,6 +52,7 @@ struct app_config {
 	const char *key_file;
 	int handshake_timeout;
 	int max_conns;
+	int pool_size;
 	int local_redirect;
 	int verbose;
 };
@@ -83,6 +84,19 @@ struct conn_arg {
 	char peer_str[INET6_ADDRSTRLEN + 16];
 };
 
+struct upstream_pool {
+	pthread_mutex_t lock;
+	pthread_cond_t cond;
+	int *fds;
+	int count;
+	int capacity;
+	int stopping;
+	int running;
+	pthread_t thread;
+	unsigned long long hits;
+	unsigned long long misses;
+};
+
 static struct app_config g_cfg = {
 	.listen = { .host = "0.0.0.0", .port = 9000 },
 	.upstream = { .host = "127.0.0.1", .port = 19000 },
@@ -92,6 +106,7 @@ static struct app_config g_cfg = {
 	.key_file = "certs/server.key",
 	.handshake_timeout = 10,
 	.max_conns = 512,
+	.pool_size = 32,
 	.local_redirect = 1,
 	.verbose = 0,
 };
@@ -109,6 +124,7 @@ static struct bpf_link *g_cg_link;
 static struct bpf_link *g_bind_link;
 static int g_same_port;
 static int g_active_conns;
+static struct upstream_pool g_pool;
 
 static volatile sig_atomic_t g_stop;
 static volatile sig_atomic_t g_want_stats;
@@ -516,6 +532,19 @@ static int connect_upstream(void)
 	if (fd < 0)
 		return -1;
 	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+	setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+#ifdef TCP_KEEPIDLE
+	{
+		int idle = 60;
+		int intvl = 10;
+		int cnt = 3;
+
+		setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+		setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl,
+			   sizeof(intvl));
+		setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+	}
+#endif
 
 	if (set_nonblocking(fd) < 0) {
 		close(fd);
@@ -553,6 +582,165 @@ static int connect_upstream(void)
 	}
 
 	return fd;
+}
+
+static int upstream_socket_usable(int fd)
+{
+	char byte;
+	ssize_t n;
+
+	do {
+		n = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+	} while (n < 0 && errno == EINTR);
+
+	if (n > 0)
+		return 1;
+	if (n == 0)
+		return 0;
+	return errno == EAGAIN || errno == EWOULDBLOCK;
+}
+
+static void *upstream_pool_worker(void *opaque)
+{
+	struct upstream_pool *pool = opaque;
+	struct timespec backoff = { .tv_sec = 0, .tv_nsec = 250000000 };
+
+	for (;;) {
+		int fd;
+
+		pthread_mutex_lock(&pool->lock);
+		while (!pool->stopping && pool->count >= pool->capacity)
+			pthread_cond_wait(&pool->cond, &pool->lock);
+		if (pool->stopping) {
+			pthread_mutex_unlock(&pool->lock);
+			break;
+		}
+		pthread_mutex_unlock(&pool->lock);
+
+		fd = connect_upstream();
+		if (fd < 0) {
+			nanosleep(&backoff, NULL);
+			continue;
+		}
+
+		pthread_mutex_lock(&pool->lock);
+		if (pool->stopping || pool->count >= pool->capacity) {
+			pthread_mutex_unlock(&pool->lock);
+			close(fd);
+			continue;
+		}
+		pool->fds[pool->count++] = fd;
+		pthread_mutex_unlock(&pool->lock);
+	}
+
+	return NULL;
+}
+
+static int upstream_pool_get(void)
+{
+	struct upstream_pool *pool = &g_pool;
+
+	for (;;) {
+		int fd = -1;
+		int capacity;
+
+		pthread_mutex_lock(&pool->lock);
+		capacity = pool->capacity;
+		if (capacity > 0 && pool->count > 0) {
+			fd = pool->fds[--pool->count];
+			__atomic_add_fetch(&pool->hits, 1, __ATOMIC_RELAXED);
+		} else {
+			__atomic_add_fetch(&pool->misses, 1, __ATOMIC_RELAXED);
+		}
+		pthread_cond_signal(&pool->cond);
+		pthread_mutex_unlock(&pool->lock);
+
+		if (capacity == 0 || fd < 0)
+			return connect_upstream();
+		if (upstream_socket_usable(fd))
+			return fd;
+		close(fd);
+	}
+}
+
+static void upstream_pool_discard(int fd)
+{
+	close(fd);
+}
+
+static int upstream_pool_start(void)
+{
+	struct upstream_pool *pool = &g_pool;
+
+	memset(pool, 0, sizeof(*pool));
+	pthread_mutex_init(&pool->lock, NULL);
+	pthread_cond_init(&pool->cond, NULL);
+
+	if (g_cfg.pool_size <= 0)
+		return 0;
+
+	pool->fds = calloc((size_t)g_cfg.pool_size, sizeof(*pool->fds));
+	if (!pool->fds)
+		return -1;
+	pool->capacity = g_cfg.pool_size;
+
+	if (pthread_create(&pool->thread, NULL, upstream_pool_worker,
+			   pool) != 0) {
+		free(pool->fds);
+		pool->fds = NULL;
+		pool->capacity = 0;
+		return -1;
+	}
+
+	pool->running = 1;
+	log_info("upstream connection pool: size=%d", pool->capacity);
+	return 0;
+}
+
+static void upstream_pool_stop(void)
+{
+	struct upstream_pool *pool = &g_pool;
+	int i;
+
+	if (!pool->running) {
+		pthread_cond_destroy(&pool->cond);
+		pthread_mutex_destroy(&pool->lock);
+		return;
+	}
+
+	pthread_mutex_lock(&pool->lock);
+	pool->stopping = 1;
+	pthread_cond_broadcast(&pool->cond);
+	for (i = 0; i < pool->count; i++)
+		close(pool->fds[i]);
+	pool->count = 0;
+	pthread_mutex_unlock(&pool->lock);
+
+	pthread_join(pool->thread, NULL);
+
+	pthread_mutex_lock(&pool->lock);
+	pool->capacity = 0;
+	pthread_mutex_unlock(&pool->lock);
+
+	pthread_cond_destroy(&pool->cond);
+	pthread_mutex_destroy(&pool->lock);
+	free(pool->fds);
+	pool->fds = NULL;
+	pool->running = 0;
+}
+
+static void print_pool_stats(void)
+{
+	unsigned long long hits;
+	unsigned long long misses;
+
+	if (!g_pool.running)
+		return;
+
+	hits = __atomic_load_n(&g_pool.hits, __ATOMIC_RELAXED);
+	misses = __atomic_load_n(&g_pool.misses, __ATOMIC_RELAXED);
+	log_info("upstream pool: size=%d hits=%llu misses=%llu",
+		 g_pool.capacity, hits, misses);
 }
 
 static int relay_loop(SSL *ssl, int cfd, int ufd)
@@ -765,7 +953,7 @@ static void *conn_thread(void *opaque)
 		cert = NULL;
 	}
 
-	ufd = connect_upstream();
+	ufd = upstream_pool_get();
 	if (ufd < 0) {
 		log_error("cannot connect upstream %s:%d for client %s: %s",
 			  g_cfg.upstream.host, g_cfg.upstream.port,
@@ -785,7 +973,7 @@ out:
 		SSL_free(ssl);
 	}
 	if (ufd >= 0)
-		close(ufd);
+		upstream_pool_discard(ufd);
 	close(fd);
 	__atomic_sub_fetch(&g_active_conns, 1, __ATOMIC_SEQ_CST);
 	free(arg);
@@ -1042,6 +1230,19 @@ static void install_signals(void)
 	signal(SIGPIPE, SIG_IGN);
 }
 
+static int wait_for_connections(int timeout_ms)
+{
+	int waited = 0;
+
+	while (__atomic_load_n(&g_active_conns, __ATOMIC_SEQ_CST) > 0) {
+		if (waited >= timeout_ms)
+			return -1;
+		usleep(10000);
+		waited += 10;
+	}
+	return 0;
+}
+
 static void accept_loop(int listen_fd)
 {
 	while (!g_stop) {
@@ -1057,6 +1258,7 @@ static void accept_loop(int listen_fd)
 		if (g_want_stats) {
 			g_want_stats = 0;
 			print_bpf_stats();
+			print_pool_stats();
 		}
 
 		pfd.fd = listen_fd;
@@ -1134,6 +1336,7 @@ static void usage(const char *prog)
 		"  -C, --allow-cn CN             allowed client cert CN; repeatable\n"
 		"  -t, --handshake-timeout SEC   TLS handshake timeout (default 10)\n"
 		"  -m, --max-conns N             concurrent connection limit (default 512)\n"
+		"  -P, --pool-size N             pre-connected upstream pool (default 32, 0=off)\n"
 		"  -L, --no-local-redirect       skip cgroup/connect4 attach\n"
 		"  -v, --verbose                 verbose logging\n"
 		"  -h, --help                    show this help\n"
@@ -1159,6 +1362,7 @@ static int parse_args(int argc, char **argv)
 		{ "allow-cn", required_argument, NULL, 'C' },
 		{ "handshake-timeout", required_argument, NULL, 't' },
 		{ "max-conns", required_argument, NULL, 'm' },
+		{ "pool-size", required_argument, NULL, 'P' },
 		{ "no-local-redirect", no_argument, NULL, 'L' },
 		{ "verbose", no_argument, NULL, 'v' },
 		{ "help", no_argument, NULL, 'h' },
@@ -1166,7 +1370,7 @@ static int parse_args(int argc, char **argv)
 	};
 	int opt;
 
-	while ((opt = getopt_long(argc, argv, "l:p:u:n:a:c:k:C:t:m:Lvh",
+	while ((opt = getopt_long(argc, argv, "l:p:u:n:a:c:k:C:t:m:P:Lvh",
 				  options, NULL)) != -1) {
 		switch (opt) {
 		case 'l':
@@ -1227,6 +1431,12 @@ static int parse_args(int argc, char **argv)
 		case 'm':
 			if (parse_int(optarg, 1, 100000, &g_cfg.max_conns)) {
 				log_error("bad --max-conns value: %s", optarg);
+				return -1;
+			}
+			break;
+		case 'P':
+			if (parse_int(optarg, 0, 4096, &g_cfg.pool_size)) {
+				log_error("bad --pool-size value: %s", optarg);
 				return -1;
 			}
 			break;
@@ -1302,6 +1512,10 @@ int main(int argc, char **argv)
 	if (bpf_setup(listen_fd) != 0)
 		goto out_listen;
 
+	if (upstream_pool_start() != 0)
+		log_warn("cannot start upstream connection pool; "
+			 "falling back to direct connects");
+
 	install_signals();
 
 	if (g_same_port)
@@ -1317,7 +1531,14 @@ int main(int argc, char **argv)
 
 	accept_loop(listen_fd);
 	print_bpf_stats();
+	print_pool_stats();
 	rc = EXIT_SUCCESS;
+
+	if (wait_for_connections((g_cfg.handshake_timeout + 10) * 1000) == 0)
+		upstream_pool_stop();
+	else
+		log_warn("connections still active at shutdown; "
+			 "skipping upstream pool cleanup");
 
 	if (g_bind_link) {
 		bpf_link__destroy(g_bind_link);

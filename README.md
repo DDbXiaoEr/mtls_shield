@@ -251,6 +251,7 @@ sudo ./scripts/demo.sh
 | `-C, --allow-cn CN` | 不限制 | 允许的客户端证书 CN，可重复 |
 | `-t, --handshake-timeout SEC` | `10` | TLS 握手超时 |
 | `-m, --max-conns N` | `512` | 最大并发连接数 |
+| `-P, --pool-size N` | `32` | 预连接 upstream 的连接池大小；`0` 关闭 |
 | `-L, --no-local-redirect` | 关闭该开关 | redirect 模式下不挂 `cgroup/connect4` |
 | `-v, --verbose` | 关闭 | 打印 libbpf 调试日志 |
 | `-h, --help` | | 帮助 |
@@ -267,6 +268,23 @@ sudo kill -USR1 <pid>
 - `sk_lookup_redirect` / `connect_redirect`：redirect 模式下的重定向次数
 - `no_proxy_socket` / `assign_error`：redirect 模式的异常计数
 - `sk_lookup_seen` / `port_match`：调试计数
+- upstream pool：连接池命中/未命中次数（`hits` / `misses`）
+
+## upstream 连接池
+
+`src/mtls_shield.c` 内置一个预连接池，后台线程持续保持 `--pool-size` 条到
+`--upstream` 的已连接 socket。新客户端完成 mTLS 握手后直接从池中取一条可用连接，
+省去 `socket()/connect()/poll()` 的握手延迟；池空时自动回退为同步连接，因此不会
+因为池大小限制并发。取出前会用 `MSG_PEEK` 做存活检查，后端已关闭或重置的连接会被
+丢弃并补充。会话结束后连接直接关闭，不在客户端之间复用，避免任意 TCP 协议的
+数据串流问题。
+
+高并发建议：
+
+- `--pool-size` 设为预估的瞬时新建连接速率，通常 32–256 即可；过大会占用后端
+  的 accept 队列和连接资源。
+- 连接池只消除 upstream 建连开销，代理仍是每连接一线程。需要上万并发连接时，
+  应进一步改成 epoll 事件驱动 + 线程池。
 
 ## 安全说明
 
@@ -288,7 +306,8 @@ sudo kill -USR1 <pid>
   生产环境建议把后端放进独立 cgroup，并把程序挂到该 cgroup 上。
 - mTLS 在代理处终结，代理到后端是回环明文。
 - 没有实现 SNI 路由、TLS 透传、CRL/OCSP。
-- 每个连接一个线程，适合演示和中小流量；高并发场景应改成事件驱动或连接池。
+- 每个连接一个线程；upstream 连接池只减少建连开销，不改变线程模型。需要
+  上万并发连接时应改成 epoll 事件驱动 + 线程池。
 - redirect 模式仍然保留，但默认不使用。
 
 ## 排障
