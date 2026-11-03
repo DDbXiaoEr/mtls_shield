@@ -132,7 +132,7 @@ Notes:
 Install dependencies on Ubuntu:
 
 ```bash
-sudo apt-get install -y clang llvm bpftool libbpf-dev libssl-dev \
+sudo apt install -y clang llvm bpftool libbpf-dev libssl-dev \
     pkg-config make gcc iproute2 curl
 ```
 

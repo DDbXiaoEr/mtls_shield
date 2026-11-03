@@ -119,7 +119,7 @@ sudo bpftool feature probe kernel  # 进一步确认程序类型/helper 是否�
 Ubuntu 安装依赖：
 
 ```bash
-sudo apt-get install -y clang llvm bpftool libbpf-dev libssl-dev \
+sudo apt install -y clang llvm bpftool libbpf-dev libssl-dev \
     pkg-config make gcc iproute2 curl
 ```
 
