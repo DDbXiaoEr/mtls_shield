@@ -66,6 +66,44 @@ TLS 握手和证书校验必须在用户态完成，eBPF 不适合在核内做�
 - `clang`、`bpftool`、`libbpf-dev`、`libssl-dev`、`pkg-config`、`curl`
 - 目标内核有 `/sys/kernel/btf/vmlinux`（Ubuntu/Debian 默认有）
 
+### 升级内核时必须检查的配置
+
+替换或升级内核后，先确认下列选项。标“必须”的布尔选项需要编译进内核（`=y`），不能是模块。
+
+| 配置 | 必需性 | 用途 |
+| --- | --- | --- |
+| `CONFIG_BPF` | 必须 | eBPF 基础支持 |
+| `CONFIG_BPF_SYSCALL` | 必须 | `bpf()` 系统调用、libbpf 加载程序 |
+| `CONFIG_CGROUPS` | 必须 | 挂载 cgroup v2 |
+| `CONFIG_CGROUP_BPF` | 必须 | `cgroup/bind4`、`cgroup/connect4` 挂载点 |
+| `CONFIG_NET` | 必须 | 网络子系统 |
+| `CONFIG_INET` | 必须 | IPv4/TCP、`sk_lookup`、`bpf_sk_assign()`、SOCKMAP |
+| `CONFIG_DEBUG_INFO_BTF` | 必须 | 生成 `/sys/kernel/btf/vmlinux`，供 `vmlinux.h` 和 CO-RE 使用 |
+| `CONFIG_NET_NS` | redirect 模式/演示必须 | `sk_lookup` 挂到 netns；demo 用 netns 模拟远端客户端 |
+| `CONFIG_BPF_JIT` | 建议 | 避免解释器开销 |
+| `CONFIG_VETH` | 仅演示 | `demo.sh` 创建 veth pair（可为模块 `=m`） |
+| `CONFIG_BPF_STREAM_PARSER` | 可选 | 仅 sockmap 流解析需要，本项目未使用 |
+
+检查命令：
+
+```bash
+KVER=$(uname -r)
+grep -E 'CONFIG_(BPF|BPF_SYSCALL|BPF_JIT|CGROUPS|CGROUP_BPF|INET|NET_NS|DEBUG_INFO_BTF|VETH|BPF_STREAM_PARSER)=' \
+    /boot/config-$KVER
+# 若没有 /boot/config-*：
+zcat /proc/config.gz | grep -E 'CONFIG_(BPF|BPF_SYSCALL|CGROUP_BPF|INET|NET_NS|DEBUG_INFO_BTF)='
+
+ls -l /sys/kernel/btf/vmlinux      # 必须存在
+stat -fc %T /sys/fs/cgroup         # 应为 cgroup2fs
+sudo bpftool feature probe kernel  # 进一步确认程序类型/helper 是否可用
+```
+
+注意：
+
+- `CONFIG_DEBUG_INFO_BTF` 依赖编译内核时的 `CONFIG_DEBUG_INFO` 和 `pahole`，自己编译内核时最容易漏。
+- cgroup 必须启用 v2 统一层级（现代发行版默认）；如被 `systemd.unified_cgroup_hierarchy=0` 或 `cgroup_no_v1` 改过，需要恢复。
+- 以 root 运行，所以不需要放开非特权 BPF（`kernel.unprivileged_bpf_disabled` 可保持默认）。
+
 ### 为什么必须 >= 5.9
 
 - `sk_lookup` 程序类型和 `bpf_sk_assign()` 辅助函数都是 **Linux 5.9 才引入**的

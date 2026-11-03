@@ -74,6 +74,48 @@ configuration does not use this mode.
 - `clang`, `bpftool`, `libbpf-dev`, `libssl-dev`, `pkg-config`, `curl`
 - `/sys/kernel/btf/vmlinux` available on the target kernel (present by default on Ubuntu/Debian)
 
+### Kernel configs to verify after upgrading the kernel
+
+After replacing or upgrading the kernel, make sure the following options are set. Boolean
+options marked "required" must be built in (`=y`), not modules.
+
+| Config | Requirement | Purpose |
+| --- | --- | --- |
+| `CONFIG_BPF` | Required | Base eBPF support |
+| `CONFIG_BPF_SYSCALL` | Required | `bpf()` syscall, libbpf program loading |
+| `CONFIG_CGROUPS` | Required | Mount cgroup v2 |
+| `CONFIG_CGROUP_BPF` | Required | `cgroup/bind4` and `cgroup/connect4` attach points |
+| `CONFIG_NET` | Required | Networking subsystem |
+| `CONFIG_INET` | Required | IPv4/TCP, `sk_lookup`, `bpf_sk_assign()`, SOCKMAP |
+| `CONFIG_DEBUG_INFO_BTF` | Required | Produces `/sys/kernel/btf/vmlinux` for `vmlinux.h` and CO-RE |
+| `CONFIG_NET_NS` | Required for redirect mode/demo | Attach `sk_lookup` to a netns; demo uses a netns to emulate a remote client |
+| `CONFIG_BPF_JIT` | Recommended | Avoid interpreter overhead |
+| `CONFIG_VETH` | Demo only | `demo.sh` creates a veth pair (module `=m` is fine) |
+| `CONFIG_BPF_STREAM_PARSER` | Optional | Only needed for sockmap stream parsing, unused here |
+
+Verification:
+
+```bash
+KVER=$(uname -r)
+grep -E 'CONFIG_(BPF|BPF_SYSCALL|BPF_JIT|CGROUPS|CGROUP_BPF|INET|NET_NS|DEBUG_INFO_BTF|VETH|BPF_STREAM_PARSER)=' \
+    /boot/config-$KVER
+# If /boot/config-* is missing:
+zcat /proc/config.gz | grep -E 'CONFIG_(BPF|BPF_SYSCALL|CGROUP_BPF|INET|NET_NS|DEBUG_INFO_BTF)='
+
+ls -l /sys/kernel/btf/vmlinux      # must exist
+stat -fc %T /sys/fs/cgroup         # should print cgroup2fs
+sudo bpftool feature probe kernel  # further confirm program types/helpers
+```
+
+Notes:
+
+- `CONFIG_DEBUG_INFO_BTF` depends on `CONFIG_DEBUG_INFO` and `pahole` at kernel build time; it
+  is the easiest option to miss when building a custom kernel.
+- cgroup v2 unified hierarchy must be enabled (the default on modern distros). Revert any
+  `systemd.unified_cgroup_hierarchy=0` or `cgroup_no_v1` settings if present.
+- The program runs as root, so unprivileged BPF does not need to be enabled
+  (`kernel.unprivileged_bpf_disabled` can stay at its default).
+
 ### Why >= 5.9 is required
 
 - The `sk_lookup` program type and the `bpf_sk_assign()` helper were both introduced in
