@@ -48,6 +48,71 @@ the legacy redirect mode: `mtls_shield` listens on another port, and eBPF `sk_lo
 `cgroup/connect4` transparently redirect connections from the original port to it. The default
 configuration does not use this mode.
 
+### Same-port mode (default)
+
+When the port given by `--listen` equals `--protect-port` (`src/mtls_shield.c:1475`), the program uses
+same-port mode. Default configuration:
+
+```bash
+sudo ./mtls_shield \
+  --listen 0.0.0.0:9000 \
+  --protect-port 9000 \
+  --upstream 127.0.0.1:19000 \
+  --ca certs/ca.crt --cert certs/server.crt --key certs/server.key
+```
+
+How it works:
+
+1. `mtls_shield` binds the original port `0.0.0.0:9000` itself and terminates mTLS.
+2. User space attaches `cgroup/bind4` to `/sys/fs/cgroup` (`src/mtls_shield.c:1087`).
+3. The backend calls `bind(9000)` with its original configuration; `bind4` rewrites the arguments to `127.0.0.1:19000` at the syscall level (`src/mtls_shield.bpf.c:138`). The backend is unaware.
+4. The proxy sends decrypted plaintext to the backend over `127.0.0.1:19000`.
+
+Port 9000 is owned by the proxy and the backend is moved to an internal port restricted to
+loopback, so the outside world cannot reach port 19000 even if it knows about it.
+
+Requirements and constraints:
+
+- `mtls_shield` must start before the backend; otherwise the backend fails with `EADDRINUSE` (`src/mtls_shield.c:507`).
+- `--upstream` must be a local address, and its port must differ from `--protect-port` (`src/mtls_shield.c:1487`, `1493`).
+- `bind4` only rewrites `bind()` calls for `--protect-port`; other ports (metrics, debug, etc.) are untouched.
+- The current code attaches `bind4` to the `/sys/fs/cgroup` root, which covers all descendant cgroups. In production, attach it to a dedicated backend cgroup to limit the blast radius.
+- IPv4 only; requires cgroup v2, root, and `CONFIG_CGROUP_BPF`. `bind4` itself needs 4.17+, but the skeleton unconditionally loads `sk_lookup`, so >= 5.9 is required in practice.
+- `--protect-cidr` is ignored in same-port mode (`src/mtls_shield.c:1498`).
+- The backend's `getsockname()` sees the internal port 19000; see the Limitations section for workarounds.
+
+When to use it:
+
+- You want clients to see only the original port and no extra proxy port.
+- The backend code and startup arguments cannot or should not be changed.
+- The backend is an ordinary TCP/HTTP service that listens on `0.0.0.0:<original port>` at startup.
+- You can guarantee the "shield first, service second" startup order; restarts of the service while the shield is running are still rewritten.
+- You want the backend to exist only on loopback, giving a stronger guarantee than redirect mode that the plaintext backend cannot be reached externally.
+- The backend does not rely on `getsockname()` for self-reporting or self-connect, or you can accept/work around the 19000 discrepancy.
+
+When not to use it, or use with care:
+
+- The service advertises its listen port from `getsockname()` in status responses.
+- The service completed its `bind()` before the shield started; eBPF cannot retroactively rewrite it.
+- The backend is outside the cgroup where `bind4` is effective.
+- IPv6-only services.
+- Services that need multiple processes to bind the same port, or have special `SO_REUSEPORT` dependencies.
+
+Same-port mode vs redirect mode:
+
+| | Same-port mode | Redirect mode |
+| --- | --- | --- |
+| Detection | `listen.port == protect_port` | `listen.port != protect_port` |
+| eBPF | `cgroup/bind4` only | `sk_lookup` + `cgroup/connect4` |
+| Backend port | Rewritten to `--upstream` | Keeps the original port |
+| `getsockname()` | Sees internal port 19000 | Sees original port 9000 |
+| Extra listening port | No | Yes |
+| Startup order | Shield must start first | No strict requirement |
+| Backend exposure | Loopback only | Bound to `0.0.0.0`, protected by `sk_lookup` |
+
+In short: choose same-port mode for a clean port surface and a hidden backend; choose redirect
+mode when the backend must report the original port or when startup order is not guaranteed.
+
 ## Layout
 
 ```

@@ -42,6 +42,68 @@ TLS 握手和证书校验必须在用户态完成，eBPF 不适合在核内做�
 `mtls_shield` 监听另一个端口，eBPF `sk_lookup` + `cgroup/connect4` 把原端口的连接
 透明重定向过去。默认配置不使用这个模式。
 
+### 同端口模式（默认）
+
+当 `--listen` 的端口和 `--protect-port` 相同时（`src/mtls_shield.c:1475`），程序使用同端口模式。默认配置：
+
+```bash
+sudo ./mtls_shield \
+  --listen 0.0.0.0:9000 \
+  --protect-port 9000 \
+  --upstream 127.0.0.1:19000 \
+  --ca certs/ca.crt --cert certs/server.crt --key certs/server.key
+```
+
+工作流程：
+
+1. `mtls_shield` 自己监听原端口 `0.0.0.0:9000`，做 mTLS 终结。
+2. 用户态把 `cgroup/bind4` 挂到 `/sys/fs/cgroup`（`src/mtls_shield.c:1087`）。
+3. 后端按原配置 `bind(9000)`；`bind4` 在系统调用层把参数改成 `127.0.0.1:19000`（`src/mtls_shield.bpf.c:138`），后端无感知。
+4. 代理把解密后的明文通过 `127.0.0.1:19000` 发给后端。
+
+9000 由代理占用，后端被挪到内部端口且限制在回环地址，因此外部即使知道 19000 也连不上。
+
+前置条件与约束：
+
+- 必须先启动 `mtls_shield`，再启动后端；否则后端会因 `EADDRINUSE` 启动失败（`src/mtls_shield.c:507`）。
+- `--upstream` 必须是本机地址，且端口不能等于 `--protect-port`（`src/mtls_shield.c:1487`、`1493`）。
+- `bind4` 只改写 `--protect-port` 的 `bind()`，其他端口（metrics、debug 等）不受影响。
+- 当前代码把 `bind4` 挂在 `/sys/fs/cgroup` 根，覆盖所有后代 cgroup；生产环境建议挂到后端专属 cgroup 以缩小影响面。
+- 仅 IPv4；需要 cgroup v2、root、`CONFIG_CGROUP_BPF`。`bind4` 本身 4.17+ 可用，但 skeleton 会无条件加载 `sk_lookup`，所以实际仍要求 >= 5.9。
+- `--protect-cidr` 在同端口模式下被忽略（`src/mtls_shield.c:1498`）。
+- 后端调用 `getsockname()` 会看到内部端口 19000，处理方式见“限制”一节。
+
+适合使用的场景：
+
+- 希望客户端只看到原端口，不额外暴露代理端口。
+- 后端代码和启动参数都不能改，或不想改。
+- 后端是普通 TCP/HTTP 服务，启动时监听 `0.0.0.0:<原端口>`。
+- 能保证“先 shield、后服务”的启动顺序；服务在 shield 运行期间重启仍会被改写。
+- 希望后端只存在于回环地址，提供比 redirect 模式更强的“明文后端不可从外部直连”保证。
+- 后端不依赖 `getsockname()` 做自我上报或自连接，或能接受/绕过 19000 的差异。
+
+不适合或需要谨慎：
+
+- 服务用 `getsockname()` 把监听端口写进状态接口。
+- 服务在 shield 启动前就已完成 `bind()`，eBPF 无法追改。
+- 后端不在 `bind4` 生效的 cgroup 范围内。
+- 纯 IPv6 服务。
+- 服务需要多个进程同时绑同一端口，或有特殊的 `SO_REUSEPORT` 依赖。
+
+同端口模式与 redirect 模式的对比：
+
+| | 同端口模式 | redirect 模式 |
+| --- | --- | --- |
+| 判定 | `listen.port == protect_port` | `listen.port != protect_port` |
+| eBPF | 只挂 `cgroup/bind4` | `sk_lookup` + `cgroup/connect4` |
+| 后端端口 | 改写到 `--upstream` | 保持原端口 |
+| `getsockname()` | 看到内部端口 19000 | 看到原端口 9000 |
+| 额外监听端口 | 无 | 有 |
+| 启动顺序 | 必须先启动 shield | 无严格要求 |
+| 后端暴露面 | 仅回环 | 绑 `0.0.0.0`，靠 `sk_lookup` 拦截 |
+
+简单选择：要“端口干净、后端藏起来”用同端口模式；要“后端状态自报正确、启动顺序随意”用 redirect 模式。
+
 ## 目录结构
 
 ```
