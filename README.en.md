@@ -322,7 +322,7 @@ For high concurrency:
 
 - IPv4 only for now; IPv6 needs `cgroup/bind6` plus IPv6 maps/programs.
 - The shield must start before the service. Attaching eBPF after the service has started cannot retroactively rewrite a completed `bind()`.
-- The backend's `getsockname()` sees the real internal port 19000; services that advertise their listen port in responses or self-connect need attention.
+- In same-port mode the backend's `getsockname()` sees the real internal port 19000; `bind4` only rewrites the `bind()` arguments and cannot hide the kernel socket's actual binding. Services that advertise their listen port in responses or self-connect can use redirect mode instead: `--listen 0.0.0.0:8443 --protect-port 9000 --upstream 127.0.0.1:9000`. In that mode `bind4` is not attached, the backend keeps listening on `0.0.0.0:9000`, and `getsockname()` returns the original value. The cost is an extra listening port, and local connections to `127.0.0.1:9000` bypass mTLS (the upstream address must not be inside a protected network, or the proxy would loop into itself). If same-port mode is required, rewrite `getsockname()` in user space with LD_PRELOAD, or rewrite the return value in the kernel with kretprobe + `bpf_probe_write_user` (not implemented here).
 - `cgroup/bind4` is attached to `/sys/fs/cgroup` and rewrites every subsequent `bind()` on the original port. In production, put the backend in its own cgroup and attach the program to that cgroup.
 - mTLS terminates at the proxy; the proxy-to-backend hop is plaintext over loopback.
 - No SNI routing, TLS passthrough, or CRL/OCSP.

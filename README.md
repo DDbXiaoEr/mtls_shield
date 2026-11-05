@@ -300,8 +300,15 @@ sudo kill -USR1 <pid>
 
 - 目前只处理 IPv4；IPv6 需要增加 `cgroup/bind6` 和 IPv6 map/program。
 - 必须先启动 shield，再启动服务。服务启动后再挂 eBPF 无法追改已经完成的 `bind()`。
-- 后端服务的 `getsockname()` 会看到真实内部端口 19000；如果服务会把监听端口
-  写进响应或做自连接，需要注意。
+- 同端口模式下后端服务的 `getsockname()` 会看到真实内部端口 19000；`bind4` 只改
+  `bind()` 的入参，无法隐藏内核 socket 的真实绑定。如果服务会把监听端口写进响应
+  或做自连接，可以改用 redirect 模式绕开：
+  `--listen 0.0.0.0:8443 --protect-port 9000 --upstream 127.0.0.1:9000`。
+  此时不挂 `bind4`，后端仍绑定 `0.0.0.0:9000`，`getsockname()` 返回原始值。代价
+  是多一个监听端口，且本机 `127.0.0.1:9000` 会绕过 mTLS（上游地址不能纳入保护
+  网段，否则代理连上游会死循环）。若必须保留同端口模式，可在用户态用 LD_PRELOAD
+  重写 `getsockname()`，或在内核用 kretprobe + `bpf_probe_write_user` 改写返回值
+  （本项目未实现）。
 - `cgroup/bind4` 挂在 `/sys/fs/cgroup`，会改写所有后续对原端口的 `bind()`。
   生产环境建议把后端放进独立 cgroup，并把程序挂到该 cgroup 上。
 - mTLS 在代理处终结，代理到后端是回环明文。
