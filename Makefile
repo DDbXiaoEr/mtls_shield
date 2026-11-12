@@ -25,10 +25,26 @@ BPF_CFLAGS := -g -O2 -Wall -Wextra -Wno-missing-declarations \
 	-I/usr/include/$(MULTIARCH)
 CFLAGS := -g -O2 -Wall -Wextra -Wno-unused-parameter \
 	-Wno-deprecated-declarations -I$(SRC_DIR)
+
+# STATIC=1（默认）：全静态链接，产物自带 libc，不受目标机 glibc 版本限制。
+# 需要 libbpf/libelf/libz/libssl/libcrypto 的静态库（各发行版的 -dev 包默认都带）。
+# 静态 glibc 的 getaddrinfo 依赖目标机的 NSS 动态模块，所以 --upstream 请直接写 IP。
+# 本地开发用 `make STATIC=0` 生成动态链接版本。
+STATIC ?= 1
+
+ifeq ($(STATIC),1)
+LDFLAGS += -static
+# 静态 glibc 的 getaddrinfo 依赖目标机 NSS 模块，静态版本只接受 IP 字面量
+CFLAGS += -DMTLS_STATIC_BUILD
+LDLIBS := $(shell pkg-config --libs --static libbpf 2>/dev/null || echo '-lbpf -lelf -lz') \
+	$(shell pkg-config --libs --static openssl 2>/dev/null || echo '-lssl -lcrypto -lpthread -ldl') \
+	-lelf -lz -lpthread
+else
 LDLIBS := $(shell pkg-config --libs libbpf 2>/dev/null || echo -lbpf) \
 	-lssl -lcrypto -lpthread -lelf -lz
+endif
 
-.PHONY: all clean certs demo
+.PHONY: all clean certs demo verify
 
 all: $(TARGET)
 
@@ -42,7 +58,19 @@ $(SKEL): $(BPF_OBJ)
 	$(BPFTOOL) gen skeleton $< name mtls_shield_bpf > $@
 
 $(TARGET): $(SRC_DIR)/mtls_shield.c $(SKEL)
-	$(CC) $(CFLAGS) -o $@ $(SRC_DIR)/mtls_shield.c $(LDLIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRC_DIR)/mtls_shield.c $(LDLIBS)
+
+verify: $(TARGET)
+	@file $(TARGET)
+ifeq ($(STATIC),1)
+	@file $(TARGET) | grep -q 'statically linked' || \
+		{ echo "error: $(TARGET) is not statically linked"; exit 1; }
+	@if readelf -V $(TARGET) 2>/dev/null | grep -q 'GLIBC_'; then \
+		echo "error: $(TARGET) still has GLIBC_ symbol versions"; exit 1; \
+	fi
+else
+	@ldd $(TARGET) || true
+endif
 
 certs:
 	./scripts/gen_certs.sh certs

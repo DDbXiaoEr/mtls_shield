@@ -292,6 +292,13 @@ static int resolve_ipv4(const char *host, struct in_addr *out)
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_INET;
 	hints.ai_socktype = SOCK_STREAM;
+#ifdef MTLS_STATIC_BUILD
+	/*
+	 * 静态 glibc 解析域名要 dlopen 目标机的 NSS 模块（libnss_dns.so.2 等），
+	 * 版本不匹配会失败。静态版本只接受 IP 字面量，配置写错时立即报错。
+	 */
+	hints.ai_flags |= AI_NUMERICHOST;
+#endif
 
 	rc = getaddrinfo(host, NULL, &hints, &res);
 	if (rc)

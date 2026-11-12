@@ -136,7 +136,8 @@ mode when the backend must report the original port or when startup order is not
   `CONFIG_CGROUP_BPF` enabled
 - cgroup v2
 - root privileges (`CAP_BPF` + `CAP_NET_ADMIN`)
-- `clang`, `bpftool`, `libbpf-dev`, `libssl-dev`, `pkg-config`, `curl`
+- `clang`, `bpftool`, `libbpf-dev`, `libssl-dev`, `libelf-dev`, `zlib1g-dev`,
+  `pkg-config`, `curl`
 - `/sys/kernel/btf/vmlinux` available on the target kernel (present by default on Ubuntu/Debian)
 
 ### Kernel configs to verify after upgrading the kernel
@@ -198,7 +199,7 @@ Install dependencies on Ubuntu:
 
 ```bash
 sudo apt install -y clang llvm bpftool libbpf-dev libssl-dev \
-    pkg-config make gcc iproute2 curl
+    libelf-dev zlib1g-dev pkg-config make gcc iproute2 curl
 ```
 
 ## Build
@@ -226,6 +227,66 @@ across kernel versions via CO-RE, but the `mtls_shield` user-space binary links
 libc/libbpf/libssl and must be built for the target architecture and libraries; cross
 compilation needs the matching toolchain. Also keep `-D__TARGET_ARCH_*` consistent with the
 target architecture. The output is `./mtls_shield`.
+
+The default build is **fully static** (`STATIC=1`), so the binary is not tied to the target
+machine's glibc version; see the next chapter for the trade-offs and verification.
+
+## Static linking and glibc compatibility
+
+### Why static by default
+
+A dynamically linked binary depends on the symbol versions of the target's `libc.so.6` and
+fails outright on older distributions with `version 'GLIBC_2.xx' not found`. This project
+links fully statically by default (`STATIC=1`), pulling `libc`, `libssl`, `libcrypto`,
+`libbpf`, `libelf` and `libz` into the binary, so `mtls_shield` no longer depends on the
+target's glibc version.
+
+### Build and verify
+
+```bash
+make            # fully static (default)
+make STATIC=0   # dynamic, for local debugging
+make verify     # inspect the artifact
+```
+
+`make verify` checks two things:
+
+- `file ./mtls_shield` reports `statically linked`
+- `readelf -V ./mtls_shield` shows no `GLIBC_` symbol version requirements
+
+The static archives come from the distro's `-dev` packages: `libbpf.a` (`libbpf-dev`),
+`libelf.a` (`libelf-dev`), `libz.a` (`zlib1g-dev`), `libssl.a` / `libcrypto.a`
+(`libssl-dev`). A missing archive shows up as `cannot find -lxxx`.
+
+### Limits of static glibc
+
+- **`getaddrinfo` depends on the target's NSS modules.** A static glibc resolves names by
+  `dlopen`-ing `libnss_dns.so.2` / `libnss_files.so.2`, which fails when the target's
+  versions do not match. The static build therefore defines `-DMTLS_STATIC_BUILD` and uses
+  `AI_NUMERICHOST`: **`--upstream` only accepts an IP literal**, and a hostname fails fast
+  at startup with `cannot resolve upstream host`. (`--listen` already goes through
+  `inet_pton` and only accepts IPs.)
+- `dlopen`, NSS plugins (LDAP/SSSD, ...) and `getpwnam`-style lookups are unreliable with a
+  static glibc; this project does not use them.
+- **Security updates require a new release.** glibc / OpenSSL CVE fixes cannot come from
+  upgrading the target system; the binary must be rebuilt and redistributed.
+- **Only libc compatibility is solved.** Kernel requirements (>= 5.9,
+  `CONFIG_DEBUG_INFO_BTF`, cgroup v2) are unrelated to static linking and still apply; see
+  "Environment requirements".
+- **License.** glibc is LGPL: redistributing a static binary requires a way to relink it
+  (object files or source). Internal-only deployment has no such concern. OpenSSL 3 is
+  Apache-2.0.
+
+### Alternatives
+
+If full static linking stops being a good fit, these alternatives are worth considering (the
+first row is what the project uses today):
+
+| Approach | glibc compatibility | Name resolution | Notes |
+| --- | --- | --- | --- |
+| `-static` with system glibc (current) | any version | IP only | smallest change |
+| Dynamic build inside an old-glibc container (e.g. CentOS 7 / glibc 2.17) | floor at 2.17 | works | broad compatibility, needs a maintained image |
+| Static musl (Alpine / `zig cc -target x86_64-linux-musl`) | fully self-contained | works (musl has its own resolver) | must build libbpf/openssl statically |
 
 ## Generate certificates
 
@@ -326,7 +387,7 @@ sudo ./scripts/demo.sh
 | --- | --- | --- |
 | `-l, --listen ADDR:PORT` | `0.0.0.0:9000` | mTLS listen address; identical to `--protect-port` means same-port mode |
 | `-p, --protect-port PORT` | `9000` | original TCP port |
-| `-u, --upstream ADDR:PORT` | `127.0.0.1:19000` | internal plaintext service address, also the bind rewrite target |
+| `-u, --upstream ADDR:PORT` | `127.0.0.1:19000` | internal plaintext service address, also the bind rewrite target; static builds accept IPs only |
 | `-n, --protect-cidr CIDR` | all local IPv4 addresses | used only in redirect mode |
 | `-a, --ca FILE` | `certs/ca.crt` | client certificate CA |
 | `-c, --cert FILE` | `certs/server.crt` | server certificate chain |
@@ -393,6 +454,8 @@ For high concurrency:
 - No SNI routing, TLS passthrough, or CRL/OCSP.
 - One thread per connection; the upstream pool reduces connect overhead but does not change the threading model. For tens of thousands of connections, use an epoll event loop plus a thread pool.
 - Redirect mode is still supported but not used by default.
+- In a static build, `--upstream` only accepts an IP literal, not a hostname (see "Static
+  linking and glibc compatibility"); a dynamic build (`make STATIC=0`) can use hostnames.
 
 ## Troubleshooting
 

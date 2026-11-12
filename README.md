@@ -125,7 +125,7 @@ sudo ./mtls_shield \
   `CONFIG_CGROUP_BPF`
 - cgroup v2
 - root 权限（`CAP_BPF` + `CAP_NET_ADMIN`）
-- `clang`、`bpftool`、`libbpf-dev`、`libssl-dev`、`pkg-config`、`curl`
+- `clang`、`bpftool`、`libbpf-dev`、`libssl-dev`、`libelf-dev`、`zlib1g-dev`、`pkg-config`、`curl`
 - 目标内核有 `/sys/kernel/btf/vmlinux`（Ubuntu/Debian 默认有）
 
 ### 升级内核时必须检查的配置
@@ -182,7 +182,7 @@ Ubuntu 安装依赖：
 
 ```bash
 sudo apt install -y clang llvm bpftool libbpf-dev libssl-dev \
-    pkg-config make gcc iproute2 curl
+    libelf-dev zlib1g-dev pkg-config make gcc iproute2 curl
 ```
 
 ## 构建
@@ -206,6 +206,61 @@ bpftool btf dump file /sys/kernel/btf/vmlinux format c > src/vmlinux.h
 注意 BPF 对象和用户态程序要分开看：BPF 对象靠 CO-RE 跨内核版本，但用户态
 `mtls_shield` 链接的是 libc/libbpf/libssl，必须针对目标架构和库编译，交叉编译需要
 对应的工具链。另外 BPF 的 `-D__TARGET_ARCH_*` 仍应与目标架构一致。产物是 `./mtls_shield`。
+
+默认构建是**全静态链接**（`STATIC=1`），产物不受目标机 glibc 版本限制；取舍、限制和
+验证方法见下一章「静态链接与 glibc 兼容性」。
+
+## 静态链接与 glibc 兼容性
+
+### 为什么默认静态链接
+
+动态链接的产物在目标机上依赖 `libc.so.6` 的符号版本，遇到较旧的发行版会直接报
+`version 'GLIBC_2.xx' not found`。本项目默认全静态链接（`STATIC=1`），把
+`libc`、`libssl`、`libcrypto`、`libbpf`、`libelf`、`libz` 全部链进二进制，
+`mtls_shield` 因此不再受目标机 glibc 版本约束。
+
+### 构建与验证
+
+```bash
+make            # 全静态（默认）
+make STATIC=0   # 动态链接，本地调试用
+make verify     # 校验产物
+```
+
+`make verify` 检查两件事：
+
+- `file ./mtls_shield` 输出 `statically linked`
+- `readelf -V ./mtls_shield` 中没有任何 `GLIBC_` 符号版本需求
+
+静态库来自各发行版的 `-dev` 包：`libbpf.a`（`libbpf-dev`）、`libelf.a`（`libelf-dev`）、
+`libz.a`（`zlib1g-dev`）、`libssl.a` / `libcrypto.a`（`libssl-dev`）。
+缺少时会报 `cannot find -lxxx`，装上对应包即可。
+
+### 静态 glibc 的限制
+
+- **`getaddrinfo` 依赖目标机的 NSS 模块。** 静态 glibc 解析域名要 `dlopen`
+  `libnss_dns.so.2` / `libnss_files.so.2`，目标机版本不匹配时解析会失败。
+  所以静态构建带 `-DMTLS_STATIC_BUILD`，用 `AI_NUMERICHOST` 编译，
+  **`--upstream` 只接受 IP 字面量**，写域名会在启动阶段报
+  `cannot resolve upstream host`。（`--listen` 本来就用 `inet_pton` 校验，只接受 IP。）
+- `dlopen`、NSS 插件（LDAP/SSSD 等）、`getpwnam` 一类接口在静态 glibc 下不可靠；
+  本项目未使用。
+- **安全更新需要重新发布。** glibc / OpenSSL 的 CVE 修复无法通过目标机系统升级获得，
+  必须重新编译并分发二进制。
+- **只解决 libc 兼容性。** 内核要求（>= 5.9、`CONFIG_DEBUG_INFO_BTF`、cgroup v2）
+  与静态链接无关，仍需逐项确认，见「环境要求」。
+- **License。** glibc 是 LGPL，对外分发静态二进制时需提供可重新链接的方式
+  （目标文件或源码）；仅内部部署无此顾虑。OpenSSL 3 是 Apache-2.0。
+
+### 其他可选方案
+
+如果以后全静态不再合适，可以考虑下面的替代路线（当前采用的是表中的第一行）：
+
+| 方案 | glibc 兼容 | 域名解析 | 说明 |
+| --- | --- | --- | --- |
+| `-static` + 系统 glibc（当前） | 通吃 | 仅 IP | 改动最小 |
+| 旧 glibc 容器内动态构建（如 CentOS 7 / glibc 2.17） | 下限 2.17 | 正常 | 兼容面广，需维护构建镜像 |
+| musl 静态（Alpine / `zig cc -target x86_64-linux-musl`） | 完全自包含 | 正常（musl 自带 resolver） | 需自行静态编译 libbpf/openssl |
 
 ## 生成证书
 
@@ -305,7 +360,7 @@ sudo ./scripts/demo.sh
 | --- | --- | --- |
 | `-l, --listen ADDR:PORT` | `0.0.0.0:9000` | mTLS 监听地址；和 `--protect-port` 相同即同端口模式 |
 | `-p, --protect-port PORT` | `9000` | 原始 TCP 端口 |
-| `-u, --upstream ADDR:PORT` | `127.0.0.1:19000` | 内部明文服务地址，也是 bind 改写目标 |
+| `-u, --upstream ADDR:PORT` | `127.0.0.1:19000` | 内部明文服务地址，也是 bind 改写目标；静态构建只接受 IP |
 | `-n, --protect-cidr CIDR` | 所有本机 IPv4 地址 | 仅 redirect 模式使用 |
 | `-a, --ca FILE` | `certs/ca.crt` | 客户端证书 CA |
 | `-c, --cert FILE` | `certs/server.crt` | 服务端证书链 |
@@ -378,6 +433,8 @@ sudo kill -USR1 <pid>
 - 每个连接一个线程；upstream 连接池只减少建连开销，不改变线程模型。需要
   上万并发连接时应改成 epoll 事件驱动 + 线程池。
 - redirect 模式仍然保留，但默认不使用。
+- 静态构建下 `--upstream` 只接受 IP 字面量，不支持域名
+  （见「静态链接与 glibc 兼容性」）；`make STATIC=0` 的动态构建可以用域名。
 
 ## 排障
 
