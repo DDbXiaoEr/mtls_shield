@@ -241,6 +241,30 @@ OpenSSL 3.5+ 还会额外要求静态 jitterentropy（`libjitterentropy.a`，来
 `libjitterentropy3-dev`），否则报 `cannot find -l:libjitterentropy.a`。
 缺少时会报 `cannot find -lxxx`，装上对应包即可。
 
+### 为什么 OpenSSL 3.5+ 还要装 `libjitterentropy3-dev`
+
+Ubuntu 26.04（OpenSSL 3.5.5）上静态链接会报：
+
+```text
+ld: cannot find -l:libjitterentropy.a
+have you installed the static version of the :libjitterentropy.a library ?
+```
+
+原因链：
+
+1. OpenSSL 3.5 起，`libcrypto.pc` 的 `Libs.private` 里带上 `-l:libjitterentropy.a`；
+2. `make` 默认全静态，`pkg-config --libs --static openssl` 会把它原样带进链接命令；
+3. 但 `libssl-dev` 不包含这个静态库，它由 `libjitterentropy3-dev` 提供；
+4. 缺这个库，`ld` 直接失败。
+
+这不是代码或 Makefile 的问题，装上即可：
+
+```bash
+sudo apt install -y libjitterentropy3-dev
+```
+
+旧系统（Ubuntu 22.04/24.04 对应的 OpenSSL 3.0/3.2）没有这个静态依赖，不会遇到。
+
 ### 静态 glibc 的限制
 
 - **`getaddrinfo` 依赖目标机的 NSS 模块。** 静态 glibc 解析域名要 `dlopen`

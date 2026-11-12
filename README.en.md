@@ -263,6 +263,32 @@ The static archives come from the distro's `-dev` packages: `libbpf.a` (`libbpf-
 (`libjitterentropy.a` from `libjitterentropy3-dev`), otherwise the link fails with
 `cannot find -l:libjitterentropy.a`. Any missing archive shows up as `cannot find -lxxx`.
 
+### Why OpenSSL 3.5+ also needs `libjitterentropy3-dev`
+
+On Ubuntu 26.04 (OpenSSL 3.5.5) a static link fails with:
+
+```text
+ld: cannot find -l:libjitterentropy.a
+have you installed the static version of the :libjitterentropy.a library ?
+```
+
+The chain of causes:
+
+1. Since OpenSSL 3.5, `libcrypto.pc` lists `-l:libjitterentropy.a` in `Libs.private`;
+2. `make` links fully statically by default, so `pkg-config --libs --static openssl`
+   carries that flag into the link command unchanged;
+3. but `libssl-dev` does not ship that static archive; `libjitterentropy3-dev` does;
+4. with the archive missing, `ld` fails outright.
+
+This is not a code or Makefile problem; installing the package is enough:
+
+```bash
+sudo apt install -y libjitterentropy3-dev
+```
+
+Older systems (OpenSSL 3.0/3.2 on Ubuntu 22.04/24.04) do not have this static dependency
+and never hit it.
+
 ### Limits of static glibc
 
 - **`getaddrinfo` depends on the target's NSS modules.** A static glibc resolves names by
