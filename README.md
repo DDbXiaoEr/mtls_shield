@@ -183,6 +183,9 @@ Ubuntu 安装依赖：
 ```bash
 sudo apt install -y clang llvm bpftool libbpf-dev libssl-dev \
     libelf-dev zlib1g-dev pkg-config make gcc iproute2 curl
+
+# OpenSSL 3.5+（Ubuntu 26.04、Debian trixie 起）静态链接还需要静态 jitterentropy：
+sudo apt install -y libjitterentropy3-dev
 ```
 
 ## 构建
@@ -234,6 +237,8 @@ make verify     # 校验产物
 
 静态库来自各发行版的 `-dev` 包：`libbpf.a`（`libbpf-dev`）、`libelf.a`（`libelf-dev`）、
 `libz.a`（`zlib1g-dev`）、`libssl.a` / `libcrypto.a`（`libssl-dev`）。
+OpenSSL 3.5+ 还会额外要求静态 jitterentropy（`libjitterentropy.a`，来自
+`libjitterentropy3-dev`），否则报 `cannot find -l:libjitterentropy.a`。
 缺少时会报 `cannot find -lxxx`，装上对应包即可。
 
 ### 静态 glibc 的限制
@@ -461,6 +466,9 @@ tail -f demo.log
 - **`--allow-cn` 不生效**：确认证书的 Subject CN 就是配置的值。
 - **端口/资源残留**：进程退出时会 detach eBPF link；`bpftool link list` 里不应再有
   对应的 `bind4`/`sk_lookup`。
+- **链接报 `cannot find -l:libjitterentropy.a`**：OpenSSL 3.5+ 的 `libcrypto.pc` 把静态
+  jitterentropy 列为依赖，装 `libjitterentropy3-dev` 即可（Ubuntu 26.04、Debian trixie 起）。
+  用 `make STATIC=0` 动态链接也可以绕过。
 
 ## 许可证
 

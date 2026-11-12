@@ -44,6 +44,14 @@ LDLIBS := $(shell pkg-config --libs libbpf 2>/dev/null || echo -lbpf) \
 	-lssl -lcrypto -lpthread -lelf -lz
 endif
 
+# OpenSSL 3.5+ 的 libcrypto.pc 把静态 jitterentropy 列为依赖，缺库时给出安装提示
+JITTERENTROPY_A := $(shell $(CC) -print-file-name=libjitterentropy.a)
+ifneq ($(filter -l:libjitterentropy.a,$(LDLIBS)),)
+ifeq ($(JITTERENTROPY_A),libjitterentropy.a)
+$(warning OpenSSL 3.5+ needs a static jitterentropy; try: sudo apt install libjitterentropy3-dev)
+endif
+endif
+
 .PHONY: all clean certs demo verify
 
 all: $(TARGET)

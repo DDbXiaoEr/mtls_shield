@@ -200,6 +200,9 @@ Install dependencies on Ubuntu:
 ```bash
 sudo apt install -y clang llvm bpftool libbpf-dev libssl-dev \
     libelf-dev zlib1g-dev pkg-config make gcc iproute2 curl
+
+# OpenSSL 3.5+ (Ubuntu 26.04+, Debian trixie+) needs a static jitterentropy for static links:
+sudo apt install -y libjitterentropy3-dev
 ```
 
 ## Build
@@ -256,7 +259,9 @@ make verify     # inspect the artifact
 
 The static archives come from the distro's `-dev` packages: `libbpf.a` (`libbpf-dev`),
 `libelf.a` (`libelf-dev`), `libz.a` (`zlib1g-dev`), `libssl.a` / `libcrypto.a`
-(`libssl-dev`). A missing archive shows up as `cannot find -lxxx`.
+(`libssl-dev`). OpenSSL 3.5+ additionally requires a static jitterentropy
+(`libjitterentropy.a` from `libjitterentropy3-dev`), otherwise the link fails with
+`cannot find -l:libjitterentropy.a`. Any missing archive shows up as `cannot find -lxxx`.
 
 ### Limits of static glibc
 
@@ -484,6 +489,9 @@ Common issues:
 - **`--allow-cn` has no effect**: make sure the certificate's Subject CN is exactly the configured value.
 - **Leftover ports/resources**: the process detaches the eBPF links on exit; `bpftool link list`
   should no longer contain the corresponding `bind4`/`sk_lookup` entries.
+- **Link fails with `cannot find -l:libjitterentropy.a`**: OpenSSL 3.5+'s `libcrypto.pc` lists
+  a static jitterentropy as a dependency; install `libjitterentropy3-dev` (Ubuntu 26.04+,
+  Debian trixie+), or link dynamically with `make STATIC=0`.
 
 ## License
 
