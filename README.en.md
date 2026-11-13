@@ -28,6 +28,16 @@ for cryptography in the kernel. The responsibilities are split as follows:
 
 Clients only ever see 9000; there is no second proxy port.
 
+### Multi-process model
+
+Ports, upstreams, and certificates are passed as comma-separated lists; the list index is the
+instance index. The main process loads eBPF once, creates all listen sockets, then forks one
+forwarding process per port. Each child handles TLS termination, certificate verification, and
+plaintext relay for its port. The main process handles no connections; it supervises the
+children, restarts them with backoff after unexpected exits, and children terminate with the
+parent through `PR_SET_PDEATHSIG`. The eBPF configuration table is keyed by original port, so
+each instance can independently use same-port or redirect mode.
+
 ### Why the backend must have an internal port
 
 Two processes cannot listen on the same IP/port at the same time. To terminate TLS on 9000,
@@ -43,42 +53,46 @@ instead, but that requires modifying the service.
 
 ### Optional redirect mode
 
-If the port given by `--listen` differs from `--protect-port`, the program automatically uses
-the legacy redirect mode: `mtls_shield` listens on another port, and eBPF `sk_lookup` +
-`cgroup/connect4` transparently redirect connections from the original port to it. The default
-configuration does not use this mode.
+If an instance's `--listenport` differs from its `--protect_port`, that instance automatically
+uses the legacy redirect mode: `mtls_shield` listens on another port, and eBPF `sk_lookup` +
+`cgroup/connect4` transparently redirect connections from the original port to it. Different
+instances may independently use same-port or redirect mode. The default configuration uses
+same-port mode.
 
 ### Same-port mode (default)
 
-When the port given by `--listen` equals `--protect-port` (`src/mtls_shield.c:1475`), the program uses
-same-port mode. Default configuration:
+When an instance's `--listenport` equals its `--protect_port`, that instance uses same-port mode.
+For example:
 
 ```bash
 sudo ./mtls_shield \
-  --listen 0.0.0.0:9000 \
-  --protect-port 9000 \
+  --listenport 9000 \
+  --protect_port 9000 \
   --upstream 127.0.0.1:19000 \
   --ca certs/ca.crt --cert certs/server.crt --key certs/server.key
 ```
 
 How it works:
 
-1. `mtls_shield` binds the original port `0.0.0.0:9000` itself and terminates mTLS.
-2. User space attaches `cgroup/bind4` to `/sys/fs/cgroup` (`src/mtls_shield.c:1087`).
-3. The backend calls `bind(9000)` with its original configuration; `bind4` rewrites the arguments to `127.0.0.1:19000` at the syscall level (`src/mtls_shield.bpf.c:138`). The backend is unaware.
-4. The proxy sends decrypted plaintext to the backend over `127.0.0.1:19000`.
+1. The main process binds all listen ports first, loads eBPF once, writes the per-port
+   configuration, and forks one forwarding process per port.
+2. User space attaches `cgroup/bind4` to `/sys/fs/cgroup`.
+3. The backend calls `bind(9000)` with its original configuration; `bind4` rewrites the arguments to `127.0.0.1:19000` at the syscall level. The backend is unaware.
+4. The forwarding process for that port sends decrypted plaintext to the backend over `127.0.0.1:19000`.
 
 Port 9000 is owned by the proxy and the backend is moved to an internal port restricted to
-loopback, so the outside world cannot reach port 19000 even if it knows about it.
+loopback, so the outside world cannot reach port 19000 even if it knows about it. The main
+process supervises the children and restarts a child that exits unexpectedly, backing off from
+1s up to 30s.
 
 Requirements and constraints:
 
-- `mtls_shield` must start before the backend; otherwise the backend fails with `EADDRINUSE` (`src/mtls_shield.c:507`).
-- `--upstream` must be a local address, and its port must differ from `--protect-port` (`src/mtls_shield.c:1487`, `1493`).
-- `bind4` only rewrites `bind()` calls for `--protect-port`; other ports (metrics, debug, etc.) are untouched.
+- `mtls_shield` must start before the backend; otherwise the backend fails with `EADDRINUSE`.
+- For a same-port instance, `--upstream` must be a local address and its port must differ from that instance's `--protect_port`.
+- `bind4` only rewrites `bind()` calls for same-port entries in the configuration table; other ports (metrics, debug, etc.) are untouched. Redirect instances are not rewritten either.
 - The current code attaches `bind4` to the `/sys/fs/cgroup` root, which covers all descendant cgroups. In production, attach it to a dedicated backend cgroup to limit the blast radius.
 - IPv4 only; requires cgroup v2, root, and `CONFIG_CGROUP_BPF`. `bind4` itself needs 4.17+, but the skeleton unconditionally loads `sk_lookup`, so >= 5.9 is required in practice.
-- `--protect-cidr` is ignored in same-port mode (`src/mtls_shield.c:1498`).
+- `--protect-cidr` is ignored when no instance uses redirect mode.
 - The backend's `getsockname()` sees the internal port 19000; see the Limitations section for workarounds.
 
 When to use it:
@@ -102,8 +116,8 @@ Same-port mode vs redirect mode:
 
 | | Same-port mode | Redirect mode |
 | --- | --- | --- |
-| Detection | `listen.port == protect_port` | `listen.port != protect_port` |
-| eBPF | `cgroup/bind4` only | `sk_lookup` + `cgroup/connect4` |
+| Detection | `listen_port == protect_port` | `listen_port != protect_port` |
+| eBPF | `cgroup/bind4` for that port | `sk_lookup` + `cgroup/connect4` for that port |
 | Backend port | Rewritten to `--upstream` | Keeps the original port |
 | `getsockname()` | Sees internal port 19000 | Sees original port 9000 |
 | Extra listening port | No | Yes |
@@ -152,7 +166,7 @@ options marked "required" must be built in (`=y`), not modules.
 | `CONFIG_CGROUPS` | Required | Mount cgroup v2 |
 | `CONFIG_CGROUP_BPF` | Required | `cgroup/bind4` and `cgroup/connect4` attach points |
 | `CONFIG_NET` | Required | Networking subsystem |
-| `CONFIG_INET` | Required | IPv4/TCP, `sk_lookup`, `bpf_sk_assign()`, SOCKMAP |
+| `CONFIG_INET` | Required | IPv4/TCP, `sk_lookup`, `bpf_sk_assign()`, SOCKHASH |
 | `CONFIG_DEBUG_INFO_BTF` | Required | Produces `/sys/kernel/btf/vmlinux` for `vmlinux.h` and CO-RE |
 | `CONFIG_NET_NS` | Required for redirect mode/demo | Attach `sk_lookup` to a netns; demo uses a netns to emulate a remote client |
 | `CONFIG_BPF_JIT` | Recommended | Avoid interpreter overhead |
@@ -295,7 +309,7 @@ and never hit it.
   `dlopen`-ing `libnss_dns.so.2` / `libnss_files.so.2`, which fails when the target's
   versions do not match. The static build therefore defines `-DMTLS_STATIC_BUILD` and uses
   `AI_NUMERICHOST`: **`--upstream` only accepts an IP literal**, and a hostname fails fast
-  at startup with `cannot resolve upstream host`. (`--listen` already goes through
+  at startup with `cannot resolve upstream host`. (`--listenport` already goes through
   `inet_pton` and only accepts IPs.)
 - `dlopen`, NSS plugins (LDAP/SSSD, ...) and `getpwnam`-style lookups are unreliable with a
   static glibc; this project does not use them.
@@ -341,8 +355,8 @@ must be attached before the service calls `bind(9000)` in order to rewrite its l
 
 ```bash
 sudo ./mtls_shield \
-  --listen 0.0.0.0:9000 \
-  --protect-port 9000 \
+  --listenport 9000 \
+  --protect_port 9000 \
   --upstream 127.0.0.1:19000 \
   --ca certs/ca.crt \
   --cert certs/server.crt \
@@ -416,22 +430,41 @@ sudo ./scripts/demo.sh
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `-l, --listen ADDR:PORT` | `0.0.0.0:9000` | mTLS listen address; identical to `--protect-port` means same-port mode |
-| `-p, --protect-port PORT` | `9000` | original TCP port |
-| `-u, --upstream ADDR:PORT` | `127.0.0.1:19000` | internal plaintext service address, also the bind rewrite target; static builds accept IPs only |
+| `-l, --listenport LIST` | required | mTLS listen ports, comma separated; list index is the instance index |
+| `-p, --protect_port LIST` | same as `--listenport` | original TCP ports, comma separated; count must match the number of ports; omit to reuse `--listenport` |
+| `-u, --upstream LIST` | required | internal plaintext `ADDR:PORT` per instance; count must equal the number of ports |
+| `-H, --listen-host ADDR` | `0.0.0.0` | listen address shared by all instances |
 | `-n, --protect-cidr CIDR` | all local IPv4 addresses | used only in redirect mode |
-| `-a, --ca FILE` | `certs/ca.crt` | client certificate CA |
-| `-c, --cert FILE` | `certs/server.crt` | server certificate chain |
-| `-k, --key FILE` | `certs/server.key` | server private key |
-| `-C, --allow-cn CN` | unrestricted | allowed client certificate CN, repeatable |
+| `-a, --ca LIST` | `certs/ca.crt` | client certificate CA per instance; one value is broadcast |
+| `-c, --cert LIST` | `certs/server.crt` | server certificate chain per instance; one value is broadcast |
+| `-k, --key LIST` | `certs/server.key` | server private key per instance; one value is broadcast |
+| `-C, --allow-cn CN` | unrestricted | allowed client certificate CN, repeatable (applies to all instances) |
 | `-t, --handshake-timeout SEC` | `10` | TLS handshake timeout |
-| `-m, --max-conns N` | `512` | maximum concurrent connections |
-| `-P, --pool-size N` | `32` | pre-connected upstream pool size; `0` disables |
+| `-m, --max-conns N` | `512` | maximum concurrent connections per forwarding process |
+| `-P, --pool-size N` | `32` | upstream pool size per forwarding process; `0` disables |
 | `-L, --no-local-redirect` | off | do not attach `cgroup/connect4` in redirect mode |
 | `-v, --verbose` | off | print libbpf debug logs |
 | `-h, --help` | | help |
 
-After startup, send `SIGUSR1` to the process to print BPF statistics:
+List arguments are matched by index, for example:
+
+```bash
+sudo ./mtls_shield \
+  --listenport 9000,9443 \
+  --protect_port 9000,9443 \
+  --upstream 127.0.0.1:19000,127.0.0.1:19443 \
+  --ca certs/ca.crt \
+  --cert certs/server.crt,certs/server-9443.crt \
+  --key certs/server.key,certs/server-9443.key
+```
+
+Instance 0 is `9000 -> 127.0.0.1:19000`; instance 1 is `9443 -> 127.0.0.1:19443`.
+A single value in a certificate list is broadcast to every instance.
+
+The main process loads eBPF once, creates all listen sockets, forks one forwarding process per
+port, and restarts a child that exits unexpectedly using exponential backoff. `SIGUSR1` to the
+main process prints BPF statistics and worker state, and is forwarded to the children so they
+print their own pool statistics:
 
 ```bash
 sudo kill -USR1 <pid>
@@ -447,8 +480,9 @@ Statistics:
 
 ## Upstream connection pool
 
-`src/mtls_shield.c` keeps a pool of pre-connected sockets to `--upstream`. A
-background thread replenishes the pool up to `--pool-size`; after a client
+`src/mtls_shield.c` keeps a per-process pool of pre-connected sockets to that
+instance's `--upstream`. A background thread replenishes the pool up to
+`--pool-size`; after a client
 finishes the mTLS handshake it takes a ready socket from the pool, avoiding the
 `socket()/connect()/poll()` round trip. If the pool is empty it falls back to a
 synchronous connect, so the pool size does not cap concurrency. Each socket is
@@ -462,8 +496,9 @@ For high concurrency:
   usually enough. A larger pool consumes backend accept-queue and connection
   resources.
 - The pool removes upstream connect latency only; the proxy still uses one
-  thread per connection. For tens of thousands of connections, move to an
-  epoll event loop plus a thread pool.
+  process per port plus one thread per connection. `--max-conns` and
+  `--pool-size` apply per forwarding process. For tens of thousands of
+  connections, move to an epoll event loop plus a thread pool.
 
 ## Security notes
 
@@ -479,7 +514,7 @@ For high concurrency:
 
 - IPv4 only for now; IPv6 needs `cgroup/bind6` plus IPv6 maps/programs.
 - The shield must start before the service. Attaching eBPF after the service has started cannot retroactively rewrite a completed `bind()`.
-- In same-port mode the backend's `getsockname()` sees the real internal port 19000; `bind4` only rewrites the `bind()` arguments and cannot hide the kernel socket's actual binding. Services that advertise their listen port in responses or self-connect can use redirect mode instead: `--listen 0.0.0.0:8443 --protect-port 9000 --upstream 127.0.0.1:9000`. In that mode `bind4` is not attached, the backend keeps listening on `0.0.0.0:9000`, and `getsockname()` returns the original value. The cost is an extra listening port, and local connections to `127.0.0.1:9000` bypass mTLS (the upstream address must not be inside a protected network, or the proxy would loop into itself). If same-port mode is required, rewrite `getsockname()` in user space with LD_PRELOAD, or rewrite the return value in the kernel with kretprobe + `bpf_probe_write_user` (not implemented here).
+- In same-port mode the backend's `getsockname()` sees the real internal port 19000; `bind4` only rewrites the `bind()` arguments and cannot hide the kernel socket's actual binding. Services that advertise their listen port in responses or self-connect can use redirect mode instead: `--listenport 8443 --protect_port 9000 --upstream 127.0.0.1:9000`. In that mode `bind4` is not attached for that instance, the backend keeps listening on `0.0.0.0:9000`, and `getsockname()` returns the original value. The cost is an extra listening port, and local connections to `127.0.0.1:9000` bypass mTLS (the upstream address must not be inside a protected network, or the proxy would loop into itself). If same-port mode is required, rewrite `getsockname()` in user space with LD_PRELOAD, or rewrite the return value in the kernel with kretprobe + `bpf_probe_write_user` (not implemented here).
 - `cgroup/bind4` is attached to `/sys/fs/cgroup` and rewrites every subsequent `bind()` on the original port. In production, put the backend in its own cgroup and attach the program to that cgroup.
 - mTLS terminates at the proxy; the proxy-to-backend hop is plaintext over loopback.
 - No SNI routing, TLS passthrough, or CRL/OCSP.
@@ -511,7 +546,7 @@ Common issues:
   was not attached, or the backend started before the shield.
 - **curl reports a certificate hostname mismatch**: `HOST_IP` did not include the IP used to
   connect when generating the certificates.
-- **Remote access fails**: make sure `--listen 0.0.0.0:9000` and that the firewall allows 9000.
+- **Remote access fails**: make sure `--listen-host 0.0.0.0` and that the firewall allows the port.
 - **`--allow-cn` has no effect**: make sure the certificate's Subject CN is exactly the configured value.
 - **Leftover ports/resources**: the process detaches the eBPF links on exit; `bpftool link list`
   should no longer contain the corresponding `bind4`/`sk_lookup` entries.

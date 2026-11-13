@@ -25,6 +25,14 @@ TLS 握手和证书校验必须在用户态完成，eBPF 不适合在核内做�
 
 客户端看到的始终只有 9000，没有第二个代理端口。
 
+### 多进程模型
+
+端口、上游和证书都以逗号分隔的列表传入，列表下标就是实例编号。主进程只加载一次
+eBPF、创建所有监听 socket，然后为每个端口 fork 一个转发子进程；子进程负责该端口的
+TLS 握手、证书校验和明文转发。主进程不处理连接，只做监督：子进程异常退出时按退避
+重启，父进程被杀死时子进程通过 `PR_SET_PDEATHSIG` 一起退出。eBPF 配置表按原端口
+索引，因此各实例可以独立选择同端口模式或 redirect 模式。
+
 ### 为什么后端一定有一个内部端口
 
 同一个 IP/端口不能让两个进程同时监听。要在 9000 上做 TLS 终结，就必须由
@@ -38,39 +46,42 @@ TLS 握手和证书校验必须在用户态完成，eBPF 不适合在核内做�
 
 ### 可选的 redirect 模式
 
-如果 `--listen` 指定的端口和 `--protect-port` 不同，程序会自动使用旧的重定向模式：
+如果某个实例的 `--listenport` 和它的 `--protect_port` 不同，该实例会自动使用旧的重定向模式：
 `mtls_shield` 监听另一个端口，eBPF `sk_lookup` + `cgroup/connect4` 把原端口的连接
-透明重定向过去。默认配置不使用这个模式。
+透明重定向过去。不同实例可以分别选择同端口模式或 redirect 模式。默认配置使用同端口模式。
 
 ### 同端口模式（默认）
 
-当 `--listen` 的端口和 `--protect-port` 相同时（`src/mtls_shield.c:1475`），程序使用同端口模式。默认配置：
+当某个实例的 `--listenport` 等于它的 `--protect_port` 时，程序对该实例使用同端口模式。
+例如：
 
 ```bash
 sudo ./mtls_shield \
-  --listen 0.0.0.0:9000 \
-  --protect-port 9000 \
+  --listenport 9000 \
+  --protect_port 9000 \
   --upstream 127.0.0.1:19000 \
   --ca certs/ca.crt --cert certs/server.crt --key certs/server.key
 ```
 
 工作流程：
 
-1. `mtls_shield` 自己监听原端口 `0.0.0.0:9000`，做 mTLS 终结。
-2. 用户态把 `cgroup/bind4` 挂到 `/sys/fs/cgroup`（`src/mtls_shield.c:1087`）。
-3. 后端按原配置 `bind(9000)`；`bind4` 在系统调用层把参数改成 `127.0.0.1:19000`（`src/mtls_shield.bpf.c:138`），后端无感知。
-4. 代理把解密后的明文通过 `127.0.0.1:19000` 发给后端。
+1. 主进程先 bind 所有监听端口，再加载一次 eBPF、写入按端口索引的配置，并给每个端口
+   fork 一个转发子进程。
+2. 用户态把 `cgroup/bind4` 挂到 `/sys/fs/cgroup`。
+3. 后端按原配置 `bind(9000)`；`bind4` 在系统调用层把参数改成 `127.0.0.1:19000`，后端无感知。
+4. 对应的转发子进程把解密后的明文通过 `127.0.0.1:19000` 发给后端。
 
 9000 由代理占用，后端被挪到内部端口且限制在回环地址，因此外部即使知道 19000 也连不上。
+主进程负责监督子进程：子进程异常退出时按 1s 起步、最长 30s 的退避重启。
 
 前置条件与约束：
 
-- 必须先启动 `mtls_shield`，再启动后端；否则后端会因 `EADDRINUSE` 启动失败（`src/mtls_shield.c:507`）。
-- `--upstream` 必须是本机地址，且端口不能等于 `--protect-port`（`src/mtls_shield.c:1487`、`1493`）。
-- `bind4` 只改写 `--protect-port` 的 `bind()`，其他端口（metrics、debug 等）不受影响。
+- 必须先启动 `mtls_shield`，再启动后端；否则后端会因 `EADDRINUSE` 启动失败。
+- 同端口实例的 `--upstream` 必须是本机地址，且端口不能等于该实例的 `--protect_port`。
+- `bind4` 只改写配置表里同端口实例的 `bind()`，其他端口（metrics、debug 等）不受影响；redirect 实例的 `bind()` 也不会被改写。
 - 当前代码把 `bind4` 挂在 `/sys/fs/cgroup` 根，覆盖所有后代 cgroup；生产环境建议挂到后端专属 cgroup 以缩小影响面。
 - 仅 IPv4；需要 cgroup v2、root、`CONFIG_CGROUP_BPF`。`bind4` 本身 4.17+ 可用，但 skeleton 会无条件加载 `sk_lookup`，所以实际仍要求 >= 5.9。
-- `--protect-cidr` 在同端口模式下被忽略（`src/mtls_shield.c:1498`）。
+- 没有任何 redirect 实例时，`--protect-cidr` 被忽略。
 - 后端调用 `getsockname()` 会看到内部端口 19000，处理方式见“限制”一节。
 
 适合使用的场景：
@@ -94,8 +105,8 @@ sudo ./mtls_shield \
 
 | | 同端口模式 | redirect 模式 |
 | --- | --- | --- |
-| 判定 | `listen.port == protect_port` | `listen.port != protect_port` |
-| eBPF | 只挂 `cgroup/bind4` | `sk_lookup` + `cgroup/connect4` |
+| 判定 | `listen_port == protect_port` | `listen_port != protect_port` |
+| eBPF | 该端口使用 `cgroup/bind4` | 该端口使用 `sk_lookup` + `cgroup/connect4` |
 | 后端端口 | 改写到 `--upstream` | 保持原端口 |
 | `getsockname()` | 看到内部端口 19000 | 看到原端口 9000 |
 | 额外监听端口 | 无 | 有 |
@@ -112,7 +123,7 @@ sudo ./mtls_shield \
 ├── README.md
 ├── src
 │   ├── mtls_shield.bpf.c   eBPF：cgroup/bind4（同端口模式）+ sk_lookup/connect4（redirect 模式）
-│   └── mtls_shield.c       用户态：加载 eBPF、TLS 监听、mTLS 校验、双向转发
+│   └── mtls_shield.c       用户态：主进程加载 eBPF 并监督，每端口一个转发子进程
 └── scripts
     ├── gen_certs.sh        生成 CA / 服务端证书 / 客户端证书 / 恶意测试证书
     ├── demo_backend.py     普通明文 HTTP 后端
@@ -139,7 +150,7 @@ sudo ./mtls_shield \
 | `CONFIG_CGROUPS` | 必须 | 挂载 cgroup v2 |
 | `CONFIG_CGROUP_BPF` | 必须 | `cgroup/bind4`、`cgroup/connect4` 挂载点 |
 | `CONFIG_NET` | 必须 | 网络子系统 |
-| `CONFIG_INET` | 必须 | IPv4/TCP、`sk_lookup`、`bpf_sk_assign()`、SOCKMAP |
+| `CONFIG_INET` | 必须 | IPv4/TCP、`sk_lookup`、`bpf_sk_assign()`、SOCKHASH |
 | `CONFIG_DEBUG_INFO_BTF` | 必须 | 生成 `/sys/kernel/btf/vmlinux`，供 `vmlinux.h` 和 CO-RE 使用 |
 | `CONFIG_NET_NS` | redirect 模式/演示必须 | `sk_lookup` 挂到 netns；demo 用 netns 模拟远端客户端 |
 | `CONFIG_BPF_JIT` | 建议 | 避免解释器开销 |
@@ -271,7 +282,7 @@ sudo apt install -y libjitterentropy3-dev
   `libnss_dns.so.2` / `libnss_files.so.2`，目标机版本不匹配时解析会失败。
   所以静态构建带 `-DMTLS_STATIC_BUILD`，用 `AI_NUMERICHOST` 编译，
   **`--upstream` 只接受 IP 字面量**，写域名会在启动阶段报
-  `cannot resolve upstream host`。（`--listen` 本来就用 `inet_pton` 校验，只接受 IP。）
+  `cannot resolve upstream host`。（`--listenport` 本来就用 `inet_pton` 校验，只接受 IP。）
 - `dlopen`、NSS 插件（LDAP/SSSD 等）、`getpwnam` 一类接口在静态 glibc 下不可靠；
   本项目未使用。
 - **安全更新需要重新发布。** glibc / OpenSSL 的 CVE 修复无法通过目标机系统升级获得，
@@ -313,8 +324,8 @@ HOST_IP=172.16.74.195 ./scripts/gen_certs.sh certs
 
 ```bash
 sudo ./mtls_shield \
-  --listen 0.0.0.0:9000 \
-  --protect-port 9000 \
+  --listenport 9000 \
+  --protect_port 9000 \
   --upstream 127.0.0.1:19000 \
   --ca certs/ca.crt \
   --cert certs/server.crt \
@@ -387,22 +398,40 @@ sudo ./scripts/demo.sh
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `-l, --listen ADDR:PORT` | `0.0.0.0:9000` | mTLS 监听地址；和 `--protect-port` 相同即同端口模式 |
-| `-p, --protect-port PORT` | `9000` | 原始 TCP 端口 |
-| `-u, --upstream ADDR:PORT` | `127.0.0.1:19000` | 内部明文服务地址，也是 bind 改写目标；静态构建只接受 IP |
+| `-l, --listenport LIST` | 必填 | mTLS 监听端口，逗号分隔，列表下标即实例编号 |
+| `-p, --protect_port LIST` | 同 `--listenport` | 原始 TCP 端口，逗号分隔，个数必须与端口数相同；省略则复用 `--listenport` |
+| `-u, --upstream LIST` | 必填 | 内部明文服务地址，按实例下标一一对应，个数必须与端口数相同 |
+| `-H, --listen-host ADDR` | `0.0.0.0` | 所有实例共用的监听地址 |
 | `-n, --protect-cidr CIDR` | 所有本机 IPv4 地址 | 仅 redirect 模式使用 |
-| `-a, --ca FILE` | `certs/ca.crt` | 客户端证书 CA |
-| `-c, --cert FILE` | `certs/server.crt` | 服务端证书链 |
-| `-k, --key FILE` | `certs/server.key` | 服务端私钥 |
-| `-C, --allow-cn CN` | 不限制 | 允许的客户端证书 CN，可重复 |
+| `-a, --ca LIST` | `certs/ca.crt` | 客户端证书 CA，按实例下标对应；只给 1 个值时广播 |
+| `-c, --cert LIST` | `certs/server.crt` | 服务端证书链，按实例下标对应；只给 1 个值时广播 |
+| `-k, --key LIST` | `certs/server.key` | 服务端私钥，按实例下标对应；只给 1 个值时广播 |
+| `-C, --allow-cn CN` | 不限制 | 允许的客户端证书 CN，可重复（对所有实例生效） |
 | `-t, --handshake-timeout SEC` | `10` | TLS 握手超时 |
-| `-m, --max-conns N` | `512` | 最大并发连接数 |
-| `-P, --pool-size N` | `32` | 预连接 upstream 的连接池大小；`0` 关闭 |
+| `-m, --max-conns N` | `512` | 每个转发子进程的最大并发连接数 |
+| `-P, --pool-size N` | `32` | 每个转发子进程的 upstream 连接池大小；`0` 关闭 |
 | `-L, --no-local-redirect` | 关闭该开关 | redirect 模式下不挂 `cgroup/connect4` |
 | `-v, --verbose` | 关闭 | 打印 libbpf 调试日志 |
 | `-h, --help` | | 帮助 |
 
-启动后给进程发 `SIGUSR1` 可以打印 BPF 统计：
+参数按数组下标对应，例如：
+
+```bash
+sudo ./mtls_shield \
+  --listenport 9000,9443 \
+  --protect_port 9000,9443 \
+  --upstream 127.0.0.1:19000,127.0.0.1:19443 \
+  --ca certs/ca.crt \
+  --cert certs/server.crt,certs/server-9443.crt \
+  --key certs/server.key,certs/server-9443.key
+```
+
+第 0 个实例是 `9000 -> 127.0.0.1:19000`，第 1 个实例是
+`9443 -> 127.0.0.1:19443`；证书列表未写满时用单值广播。
+
+主进程只加载一次 eBPF，并负责创建所有监听 socket、fork 每个端口的转发子进程、
+在子进程异常退出时按退避策略重启。给主进程发 `SIGUSR1` 会打印 BPF 统计和各子进程
+状态，并转发给子进程打印各自的连接池统计：
 
 ```bash
 sudo kill -USR1 <pid>
@@ -418,7 +447,7 @@ sudo kill -USR1 <pid>
 
 ## upstream 连接池
 
-`src/mtls_shield.c` 内置一个预连接池，后台线程持续保持 `--pool-size` 条到
+每个转发子进程各有一个预连接池，后台线程持续保持 `--pool-size` 条到该实例
 `--upstream` 的已连接 socket。新客户端完成 mTLS 握手后直接从池中取一条可用连接，
 省去 `socket()/connect()/poll()` 的握手延迟；池空时自动回退为同步连接，因此不会
 因为池大小限制并发。取出前会用 `MSG_PEEK` 做存活检查，后端已关闭或重置的连接会被
@@ -429,7 +458,8 @@ sudo kill -USR1 <pid>
 
 - `--pool-size` 设为预估的瞬时新建连接速率，通常 32–256 即可；过大会占用后端
   的 accept 队列和连接资源。
-- 连接池只消除 upstream 建连开销，代理仍是每连接一线程。需要上万并发连接时，
+- 连接池只消除 upstream 建连开销，代理仍是“每端口一个进程 + 每连接一线程”。
+  `--max-conns` 和 `--pool-size` 都按子进程生效。需要上万并发连接时，
   应进一步改成 epoll 事件驱动 + 线程池。
 
 ## 安全说明
@@ -449,8 +479,8 @@ sudo kill -USR1 <pid>
 - 同端口模式下后端服务的 `getsockname()` 会看到真实内部端口 19000；`bind4` 只改
   `bind()` 的入参，无法隐藏内核 socket 的真实绑定。如果服务会把监听端口写进响应
   或做自连接，可以改用 redirect 模式绕开：
-  `--listen 0.0.0.0:8443 --protect-port 9000 --upstream 127.0.0.1:9000`。
-  此时不挂 `bind4`，后端仍绑定 `0.0.0.0:9000`，`getsockname()` 返回原始值。代价
+  `--listenport 8443 --protect_port 9000 --upstream 127.0.0.1:9000`。
+  此时该实例不挂 `bind4`，后端仍绑定 `0.0.0.0:9000`，`getsockname()` 返回原始值。代价
   是多一个监听端口，且本机 `127.0.0.1:9000` 会绕过 mTLS（上游地址不能纳入保护
   网段，否则代理连上游会死循环）。若必须保留同端口模式，可在用户态用 LD_PRELOAD
   重写 `getsockname()`，或在内核用 kretprobe + `bpf_probe_write_user` 改写返回值
@@ -486,7 +516,7 @@ tail -f demo.log
 - **后端还在 9000**：确认 `ss` 显示后端在 19000；如果不在，说明 `bind4` 没挂上，
   或后端启动早于 shield。
 - **curl 报证书主机名不匹配**：生成证书时 `HOST_IP` 没包含访问用的 IP。
-- **远端访问不到**：确认 `--listen 0.0.0.0:9000`，防火墙放行 9000。
+- **远端访问不到**：确认 `--listen-host 0.0.0.0` 且防火墙放行对应端口。
 - **`--allow-cn` 不生效**：确认证书的 Subject CN 就是配置的值。
 - **端口/资源残留**：进程退出时会 detach eBPF link；`bpftool link list` 里不应再有
   对应的 `bind4`/`sk_lookup`。

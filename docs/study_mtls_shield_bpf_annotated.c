@@ -3,6 +3,11 @@
  *  mtls_shield eBPF 程序学习注释版（study_mtls_shield_bpf_annotated.c）
  * =====================================================================================
  *
+ *  【版本说明】
+ *  本文件基于早期的“单进程、单端口”实现（单条 shield_cfg、SOCKMAP key=0）。
+ *  当前版本的配置表按原端口索引，redirect 模式的代理 socket 改用 SOCKHASH，
+ *  以 src/mtls_shield.bpf.c 为准。
+ *
  *  【本文件用途】
  *  对应源文件 src/mtls_shield.bpf.c（约 165 行），逐行讲解 eBPF 内核态代码。
  *  本文件【不能直接编译】（注释量远超代码，且部分示例代码标注为"错误写法"），

@@ -19,9 +19,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -29,32 +31,34 @@
 #include <bpf/libbpf.h>
 
 #include <openssl/err.h>
+#include <openssl/rand.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
 #include "mtls_shield.skel.h"
 
+#define MAX_INSTANCES 64
 #define MAX_NETS 128
 #define MAX_ALLOW_CN 16
 #define RELAY_BUF_SIZE 65536
+
+/* 与 src/mtls_shield.bpf.c 中的定义保持一致 */
+#define SHIELD_MODE_SAME_PORT 1
+#define SHIELD_MODE_REDIRECT 2
 
 struct endpoint {
 	char host[256];
 	int port;
 };
 
-struct app_config {
-	struct endpoint listen;
-	struct endpoint upstream;
-	int protect_port;
-	const char *ca_file;
-	const char *cert_file;
-	const char *key_file;
-	int handshake_timeout;
-	int max_conns;
-	int pool_size;
-	int local_redirect;
-	int verbose;
+/* 与 BPF shield_cfg_map 的 value 布局保持一致 */
+struct shield_port_cfg {
+	uint32_t enabled;
+	uint32_t backend_ip4;
+	uint16_t proxy_port;
+	uint16_t backend_port;
+	uint16_t mode;
+	uint16_t reserved;
 };
 
 struct net_cidr {
@@ -63,25 +67,9 @@ struct net_cidr {
 	int prefix;
 };
 
-struct shield_cfg {
-	uint32_t enabled;
-	uint32_t backend_ip4;
-	uint16_t protect_port;
-	uint16_t proxy_port;
-	uint16_t backend_port;
-	uint16_t reserved;
-};
-
 struct lpm_key {
 	uint32_t prefixlen;
 	uint32_t ip;
-};
-
-struct conn_arg {
-	int fd;
-	struct sockaddr_storage peer;
-	socklen_t peer_len;
-	char peer_str[INET6_ADDRSTRLEN + 16];
 };
 
 struct upstream_pool {
@@ -97,13 +85,51 @@ struct upstream_pool {
 	unsigned long long misses;
 };
 
+/*
+ * 一个实例对应一个被终结的端口，也对应一个转发子进程。
+ * 列表参数按数组下标一一对应：listen_port[i]/protect_port[i]/
+ * upstream[i]/ca[i]/cert[i]/key[i]。
+ */
+struct instance_cfg {
+	int index;
+	int listen_port;
+	int protect_port;
+	struct endpoint upstream;
+	struct sockaddr_in upstream_addr;
+	const char *ca_file;
+	const char *cert_file;
+	const char *key_file;
+	int same_port;
+	int listen_fd;
+	pid_t pid;
+	int restart_delay;
+	long long restart_at_ms;
+	long long started_at_ms;
+	struct upstream_pool pool;
+	int active_conns;
+};
+
+struct app_config {
+	struct instance_cfg inst[MAX_INSTANCES];
+	int count;
+	char listen_host[256];
+	int handshake_timeout;
+	int max_conns;
+	int pool_size;
+	int local_redirect;
+	int verbose;
+};
+
+struct conn_arg {
+	struct instance_cfg *inst;
+	int fd;
+	struct sockaddr_storage peer;
+	socklen_t peer_len;
+	char peer_str[INET6_ADDRSTRLEN + 16];
+};
+
 static struct app_config g_cfg = {
-	.listen = { .host = "0.0.0.0", .port = 9000 },
-	.upstream = { .host = "127.0.0.1", .port = 19000 },
-	.protect_port = 9000,
-	.ca_file = "certs/ca.crt",
-	.cert_file = "certs/server.crt",
-	.key_file = "certs/server.key",
+	.listen_host = "0.0.0.0",
 	.handshake_timeout = 10,
 	.max_conns = 512,
 	.pool_size = 32,
@@ -111,23 +137,40 @@ static struct app_config g_cfg = {
 	.verbose = 0,
 };
 
+/* 当前子进程正在服务的实例；父进程中为 NULL */
+static struct instance_cfg *g_inst;
+
 static struct net_cidr g_nets[MAX_NETS];
 static int g_net_count;
 static char *g_allow_cns[MAX_ALLOW_CN];
 static int g_allow_cn_count;
 
-static struct sockaddr_in g_upstream_addr;
 static SSL_CTX *g_tls_ctx;
 static struct mtls_shield_bpf *g_skel;
 static struct bpf_link *g_sk_link;
 static struct bpf_link *g_cg_link;
 static struct bpf_link *g_bind_link;
-static int g_same_port;
-static int g_active_conns;
-static struct upstream_pool g_pool;
 
 static volatile sig_atomic_t g_stop;
 static volatile sig_atomic_t g_want_stats;
+static volatile sig_atomic_t g_child_event;
+
+static char g_tag_buf[64];
+static const char *g_tag = "main";
+
+/* 参数列表（逗号分隔） */
+static char *g_listen_items[MAX_INSTANCES];
+static int g_listen_count;
+static char *g_protect_items[MAX_INSTANCES];
+static int g_protect_count;
+static char *g_upstream_items[MAX_INSTANCES];
+static int g_upstream_count;
+static char *g_ca_items[MAX_INSTANCES];
+static int g_ca_count;
+static char *g_cert_items[MAX_INSTANCES];
+static int g_cert_count;
+static char *g_key_items[MAX_INSTANCES];
+static int g_key_count;
 
 static void log_msg(const char *level, const char *fmt, va_list ap)
 {
@@ -137,7 +180,7 @@ static void log_msg(const char *level, const char *fmt, va_list ap)
 
 	localtime_r(&now, &tm);
 	strftime(ts, sizeof(ts), "%H:%M:%S", &tm);
-	fprintf(stderr, "[%s] %-5s ", ts, level);
+	fprintf(stderr, "[%s] [%s] %-5s ", ts, g_tag, level);
 	vfprintf(stderr, fmt, ap);
 	fputc('\n', stderr);
 }
@@ -188,6 +231,14 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format,
 	return vfprintf(stderr, format, args);
 }
 
+static long long now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 static int parse_int(const char *s, int min, int max, int *out)
 {
 	char *end = NULL;
@@ -218,6 +269,56 @@ static int parse_endpoint(const char *s, struct endpoint *ep)
 		return -1;
 	snprintf(ep->host, sizeof(ep->host), "%s", buf);
 	ep->port = port;
+	return 0;
+}
+
+static int split_csv(char *s, char **out, int max, const char *name)
+{
+	char *p = s;
+	int n = 0;
+
+	while (p && *p) {
+		char *comma = strchr(p, ',');
+		char *end;
+
+		if (comma)
+			*comma = '\0';
+		end = p + strlen(p);
+		while (*p == ' ' || *p == '\t')
+			p++;
+		while (end > p && (end[-1] == ' ' || end[-1] == '\t'))
+			*--end = '\0';
+		if (*p == '\0') {
+			log_error("%s has an empty item", name);
+			return -1;
+		}
+		if (n >= max) {
+			log_error("%s has too many items (max %d)", name, max);
+			return -1;
+		}
+		out[n++] = p;
+		if (!comma)
+			break;
+		p = comma + 1;
+	}
+
+	if (n == 0) {
+		log_error("%s needs at least one item", name);
+		return -1;
+	}
+	return n;
+}
+
+static int parse_list_option(char *arg, char **items, int *count, int max,
+			     const char *name)
+{
+	int n = split_csv(arg, items, max, name);
+
+	if (n < 0) {
+		*count = 0;
+		return -1;
+	}
+	*count = n;
 	return 0;
 }
 
@@ -432,61 +533,89 @@ static int verify_client_cert(int preverify_ok, X509_STORE_CTX *store)
 	return 0;
 }
 
-static int tls_init(void)
+static SSL_CTX *tls_ctx_new(const struct instance_cfg *inst)
 {
+	SSL_CTX *ctx;
 	STACK_OF(X509_NAME) *ca_names;
 
 	OPENSSL_init_ssl(0, NULL);
 
-	g_tls_ctx = SSL_CTX_new(TLS_server_method());
-	if (!g_tls_ctx) {
+	ctx = SSL_CTX_new(TLS_server_method());
+	if (!ctx) {
 		log_error("SSL_CTX_new failed: %s", ssl_error_string());
-		return -1;
+		return NULL;
 	}
 
-	if (!SSL_CTX_set_min_proto_version(g_tls_ctx, TLS1_2_VERSION)) {
+	if (!SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION)) {
 		log_error("failed to set minimum TLS version");
-		return -1;
+		goto fail;
 	}
-	SSL_CTX_set_options(g_tls_ctx, SSL_OP_NO_COMPRESSION);
-	SSL_CTX_set_mode(g_tls_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE |
-				   SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+	SSL_CTX_set_options(ctx, SSL_OP_NO_COMPRESSION);
+	SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE |
+			      SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
 
-	if (!SSL_CTX_use_certificate_chain_file(g_tls_ctx, g_cfg.cert_file)) {
+	if (!SSL_CTX_use_certificate_chain_file(ctx, inst->cert_file)) {
 		log_error("cannot load server certificate %s: %s",
-			  g_cfg.cert_file, ssl_error_string());
-		return -1;
+			  inst->cert_file, ssl_error_string());
+		goto fail;
 	}
-	if (!SSL_CTX_use_PrivateKey_file(g_tls_ctx, g_cfg.key_file,
+	if (!SSL_CTX_use_PrivateKey_file(ctx, inst->key_file,
 					 SSL_FILETYPE_PEM)) {
-		log_error("cannot load private key %s: %s", g_cfg.key_file,
+		log_error("cannot load private key %s: %s", inst->key_file,
 			  ssl_error_string());
-		return -1;
+		goto fail;
 	}
-	if (!SSL_CTX_check_private_key(g_tls_ctx)) {
+	if (!SSL_CTX_check_private_key(ctx)) {
 		log_error("server certificate and key do not match");
-		return -1;
+		goto fail;
 	}
-	if (!SSL_CTX_load_verify_locations(g_tls_ctx, g_cfg.ca_file, NULL)) {
-		log_error("cannot load client CA %s: %s", g_cfg.ca_file,
+	if (!SSL_CTX_load_verify_locations(ctx, inst->ca_file, NULL)) {
+		log_error("cannot load client CA %s: %s", inst->ca_file,
 			  ssl_error_string());
-		return -1;
+		goto fail;
 	}
 
-	ca_names = SSL_load_client_CA_file(g_cfg.ca_file);
+	ca_names = SSL_load_client_CA_file(inst->ca_file);
 	if (!ca_names) {
-		log_error("cannot build client CA list from %s", g_cfg.ca_file);
-		return -1;
+		log_error("cannot build client CA list from %s", inst->ca_file);
+		goto fail;
 	}
-	SSL_CTX_set_client_CA_list(g_tls_ctx, ca_names);
-	SSL_CTX_set_verify(g_tls_ctx,
+	SSL_CTX_set_client_CA_list(ctx, ca_names);
+	SSL_CTX_set_verify(ctx,
 			   SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
 			   verify_client_cert);
 
+	return ctx;
+
+fail:
+	SSL_CTX_free(ctx);
+	return NULL;
+}
+
+/* 父进程在 fork 前统一校验一遍证书，避免子进程反复启动失败 */
+static int tls_validate_all(void)
+{
+	int i;
+
+	for (i = 0; i < g_cfg.count; i++) {
+		SSL_CTX *ctx = tls_ctx_new(&g_cfg.inst[i]);
+
+		if (!ctx) {
+			log_error("instance #%d certificate check failed", i);
+			return -1;
+		}
+		SSL_CTX_free(ctx);
+	}
 	return 0;
 }
 
-static int create_listener(void)
+static int tls_init(const struct instance_cfg *inst)
+{
+	g_tls_ctx = tls_ctx_new(inst);
+	return g_tls_ctx ? 0 : -1;
+}
+
+static int create_listener(struct instance_cfg *inst)
 {
 	struct sockaddr_in addr;
 	int fd;
@@ -494,40 +623,45 @@ static int create_listener(void)
 
 	fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	if (fd < 0) {
-		log_error("socket: %s", strerror(errno));
+		log_error("instance #%d: socket: %s", inst->index,
+			  strerror(errno));
 		return -1;
 	}
 	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
-	addr.sin_port = htons(g_cfg.listen.port);
-	if (inet_pton(AF_INET, g_cfg.listen.host, &addr.sin_addr) != 1) {
-		log_error("invalid listen address: %s", g_cfg.listen.host);
+	addr.sin_port = htons((uint16_t)inst->listen_port);
+	if (inet_pton(AF_INET, g_cfg.listen_host, &addr.sin_addr) != 1) {
+		log_error("instance #%d: invalid listen address: %s",
+			  inst->index, g_cfg.listen_host);
 		close(fd);
 		return -1;
 	}
 
 	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		log_error("bind %s:%d: %s", g_cfg.listen.host,
-			  g_cfg.listen.port, strerror(errno));
-		if (g_same_port && errno == EADDRINUSE)
-			log_error("start mtls_shield before the backend so "
-				  "cgroup/bind4 can move the backend's bind() "
-				  "to %s:%d",
-				  g_cfg.upstream.host, g_cfg.upstream.port);
+		log_error("instance #%d: bind %s:%d: %s", inst->index,
+			  g_cfg.listen_host, inst->listen_port,
+			  strerror(errno));
+		if (inst->same_port && errno == EADDRINUSE)
+			log_error("instance #%d: start mtls_shield before the "
+				  "backend so cgroup/bind4 can move the "
+				  "backend's bind() to %s:%d",
+				  inst->index, inst->upstream.host,
+				  inst->upstream.port);
 		close(fd);
 		return -1;
 	}
 	if (listen(fd, 256) < 0) {
-		log_error("listen: %s", strerror(errno));
+		log_error("instance #%d: listen: %s", inst->index,
+			  strerror(errno));
 		close(fd);
 		return -1;
 	}
 	return fd;
 }
 
-static int connect_upstream(void)
+static int connect_upstream(const struct instance_cfg *inst)
 {
 	struct pollfd pfd;
 	int fd;
@@ -558,8 +692,8 @@ static int connect_upstream(void)
 		return -1;
 	}
 
-	if (connect(fd, (struct sockaddr *)&g_upstream_addr,
-		    sizeof(g_upstream_addr)) < 0) {
+	if (connect(fd, (struct sockaddr *)&inst->upstream_addr,
+		    sizeof(inst->upstream_addr)) < 0) {
 		if (errno != EINPROGRESS) {
 			close(fd);
 			return -1;
@@ -609,7 +743,8 @@ static int upstream_socket_usable(int fd)
 
 static void *upstream_pool_worker(void *opaque)
 {
-	struct upstream_pool *pool = opaque;
+	struct instance_cfg *inst = opaque;
+	struct upstream_pool *pool = &inst->pool;
 	struct timespec backoff = { .tv_sec = 0, .tv_nsec = 250000000 };
 
 	for (;;) {
@@ -624,7 +759,7 @@ static void *upstream_pool_worker(void *opaque)
 		}
 		pthread_mutex_unlock(&pool->lock);
 
-		fd = connect_upstream();
+		fd = connect_upstream(inst);
 		if (fd < 0) {
 			nanosleep(&backoff, NULL);
 			continue;
@@ -643,9 +778,9 @@ static void *upstream_pool_worker(void *opaque)
 	return NULL;
 }
 
-static int upstream_pool_get(void)
+static int upstream_pool_get(struct instance_cfg *inst)
 {
-	struct upstream_pool *pool = &g_pool;
+	struct upstream_pool *pool = &inst->pool;
 
 	for (;;) {
 		int fd = -1;
@@ -663,7 +798,7 @@ static int upstream_pool_get(void)
 		pthread_mutex_unlock(&pool->lock);
 
 		if (capacity == 0 || fd < 0)
-			return connect_upstream();
+			return connect_upstream(inst);
 		if (upstream_socket_usable(fd))
 			return fd;
 		close(fd);
@@ -675,9 +810,9 @@ static void upstream_pool_discard(int fd)
 	close(fd);
 }
 
-static int upstream_pool_start(void)
+static int upstream_pool_start(struct instance_cfg *inst)
 {
-	struct upstream_pool *pool = &g_pool;
+	struct upstream_pool *pool = &inst->pool;
 
 	memset(pool, 0, sizeof(*pool));
 	pthread_mutex_init(&pool->lock, NULL);
@@ -692,7 +827,7 @@ static int upstream_pool_start(void)
 	pool->capacity = g_cfg.pool_size;
 
 	if (pthread_create(&pool->thread, NULL, upstream_pool_worker,
-			   pool) != 0) {
+			   inst) != 0) {
 		free(pool->fds);
 		pool->fds = NULL;
 		pool->capacity = 0;
@@ -704,9 +839,9 @@ static int upstream_pool_start(void)
 	return 0;
 }
 
-static void upstream_pool_stop(void)
+static void upstream_pool_stop(struct instance_cfg *inst)
 {
-	struct upstream_pool *pool = &g_pool;
+	struct upstream_pool *pool = &inst->pool;
 	int i;
 
 	if (!pool->running) {
@@ -736,18 +871,18 @@ static void upstream_pool_stop(void)
 	pool->running = 0;
 }
 
-static void print_pool_stats(void)
+static void print_pool_stats(struct instance_cfg *inst)
 {
 	unsigned long long hits;
 	unsigned long long misses;
 
-	if (!g_pool.running)
+	if (!inst->pool.running)
 		return;
 
-	hits = __atomic_load_n(&g_pool.hits, __ATOMIC_RELAXED);
-	misses = __atomic_load_n(&g_pool.misses, __ATOMIC_RELAXED);
+	hits = __atomic_load_n(&inst->pool.hits, __ATOMIC_RELAXED);
+	misses = __atomic_load_n(&inst->pool.misses, __ATOMIC_RELAXED);
 	log_info("upstream pool: size=%d hits=%llu misses=%llu",
-		 g_pool.capacity, hits, misses);
+		 inst->pool.capacity, hits, misses);
 }
 
 static int relay_loop(SSL *ssl, int cfd, int ufd)
@@ -913,6 +1048,7 @@ static int relay_loop(SSL *ssl, int cfd, int ufd)
 static void *conn_thread(void *opaque)
 {
 	struct conn_arg *arg = opaque;
+	struct instance_cfg *inst = arg->inst;
 	SSL *ssl = NULL;
 	X509 *cert = NULL;
 	char cn[256] = "-";
@@ -960,17 +1096,17 @@ static void *conn_thread(void *opaque)
 		cert = NULL;
 	}
 
-	ufd = upstream_pool_get();
+	ufd = upstream_pool_get(inst);
 	if (ufd < 0) {
 		log_error("cannot connect upstream %s:%d for client %s: %s",
-			  g_cfg.upstream.host, g_cfg.upstream.port,
+			  inst->upstream.host, inst->upstream.port,
 			  arg->peer_str, strerror(errno));
 		goto out;
 	}
 
 	log_info("mTLS ok client=%s cn=%s local=%s upstream=%s:%d",
-		 arg->peer_str, cn, local_str, g_cfg.upstream.host,
-		 g_cfg.upstream.port);
+		 arg->peer_str, cn, local_str, inst->upstream.host,
+		 inst->upstream.port);
 
 	relay_loop(ssl, fd, ufd);
 
@@ -982,7 +1118,7 @@ out:
 	if (ufd >= 0)
 		upstream_pool_discard(ufd);
 	close(fd);
-	__atomic_sub_fetch(&g_active_conns, 1, __ATOMIC_SEQ_CST);
+	__atomic_sub_fetch(&inst->active_conns, 1, __ATOMIC_SEQ_CST);
 	free(arg);
 	return NULL;
 }
@@ -1054,16 +1190,30 @@ static struct bpf_link *attach_cgroup_prog(struct bpf_program *prog,
 	return link;
 }
 
-static int bpf_setup(int listen_fd)
+static int any_same_port(void)
 {
-	struct lpm_key net_key;
-	struct shield_cfg cfg;
-	uint32_t key = 0;
-	uint32_t enabled = 1;
-	int netns_fd;
-	int map_fd;
 	int i;
 
+	for (i = 0; i < g_cfg.count; i++) {
+		if (g_cfg.inst[i].same_port)
+			return 1;
+	}
+	return 0;
+}
+
+static int any_redirect_mode(void)
+{
+	int i;
+
+	for (i = 0; i < g_cfg.count; i++) {
+		if (!g_cfg.inst[i].same_port)
+			return 1;
+	}
+	return 0;
+}
+
+static int bpf_load(void)
+{
 	g_skel = mtls_shield_bpf__open();
 	if (!g_skel) {
 		log_error("cannot open BPF skeleton: %s", strerror(errno));
@@ -1074,24 +1224,87 @@ static int bpf_setup(int listen_fd)
 		log_error("cannot load BPF programs: %s", strerror(errno));
 		return -1;
 	}
+	return 0;
+}
 
-	memset(&cfg, 0, sizeof(cfg));
-	cfg.enabled = 1;
-	cfg.protect_port = htons((uint16_t)g_cfg.protect_port);
-	cfg.proxy_port = htons((uint16_t)g_cfg.listen.port);
-	if (g_same_port) {
-		cfg.backend_ip4 = g_upstream_addr.sin_addr.s_addr;
-		cfg.backend_port = htons((uint16_t)g_cfg.upstream.port);
-	}
+static int bpf_configure(void)
+{
+	uint32_t key;
+	int map_fd;
+	int i;
 
 	map_fd = bpf_map__fd(g_skel->maps.shield_cfg_map);
-	if (map_fd < 0 ||
-	    bpf_map_update_elem(map_fd, &key, &cfg, BPF_ANY) != 0) {
-		log_error("cannot write shield config map: %s", strerror(errno));
+	if (map_fd < 0) {
+		log_error("cannot get shield config map fd");
 		return -1;
 	}
 
-	if (g_same_port) {
+	for (i = 0; i < g_cfg.count; i++) {
+		struct instance_cfg *inst = &g_cfg.inst[i];
+		struct shield_port_cfg cfg;
+
+		memset(&cfg, 0, sizeof(cfg));
+		cfg.enabled = 1;
+		cfg.proxy_port = htons((uint16_t)inst->listen_port);
+		if (inst->same_port) {
+			cfg.mode = SHIELD_MODE_SAME_PORT;
+			cfg.backend_ip4 = inst->upstream_addr.sin_addr.s_addr;
+			cfg.backend_port = htons((uint16_t)inst->upstream.port);
+		} else {
+			cfg.mode = SHIELD_MODE_REDIRECT;
+		}
+
+		key = (uint32_t)inst->protect_port;
+		if (bpf_map_update_elem(map_fd, &key, &cfg, BPF_ANY) != 0) {
+			log_error("cannot write shield config for tcp/%d: %s",
+				  inst->protect_port, strerror(errno));
+			return -1;
+		}
+	}
+
+	if (any_redirect_mode()) {
+		map_fd = bpf_map__fd(g_skel->maps.protect_nets);
+		for (i = 0; i < g_net_count; i++) {
+			struct lpm_key net_key;
+			uint32_t enabled = 1;
+
+			net_key.prefixlen = (uint32_t)g_nets[i].prefix;
+			net_key.ip = g_nets[i].ip;
+			if (bpf_map_update_elem(map_fd, &net_key, &enabled,
+						BPF_ANY) != 0) {
+				log_error("cannot add protected network: %s",
+					  strerror(errno));
+				return -1;
+			}
+		}
+
+		/* redirect 模式下每个原端口对应自己的代理监听 socket */
+		map_fd = bpf_map__fd(g_skel->maps.proxy_socks);
+		for (i = 0; i < g_cfg.count; i++) {
+			struct instance_cfg *inst = &g_cfg.inst[i];
+
+			if (inst->same_port)
+				continue;
+			key = (uint32_t)inst->protect_port;
+			if (bpf_map_update_elem(map_fd, &key,
+						&inst->listen_fd,
+						BPF_ANY) != 0) {
+				log_error("cannot publish proxy socket for "
+					  "tcp/%d: %s", inst->protect_port,
+					  strerror(errno));
+				return -1;
+			}
+		}
+	}
+
+	return 0;
+}
+
+static int bpf_attach(void)
+{
+	int netns_fd;
+
+	if (any_same_port()) {
 		g_bind_link = attach_cgroup_prog(g_skel->progs.shield_bind4,
 						 "/sys/fs/cgroup");
 		if (!g_bind_link) {
@@ -1099,68 +1312,58 @@ static int bpf_setup(int listen_fd)
 				  strerror(errno));
 			return -1;
 		}
-		log_info("attached cgroup/bind4; backend binds to tcp/%d "
-			 "will be moved to %s:%d",
-			 g_cfg.protect_port, g_cfg.upstream.host,
-			 g_cfg.upstream.port);
-		return 0;
+		log_info("attached cgroup/bind4 for same-port instances");
 	}
 
-	map_fd = bpf_map__fd(g_skel->maps.protect_nets);
-	for (i = 0; i < g_net_count; i++) {
-		net_key.prefixlen = (uint32_t)g_nets[i].prefix;
-		net_key.ip = g_nets[i].ip;
-		if (bpf_map_update_elem(map_fd, &net_key, &enabled,
-					BPF_ANY) != 0) {
-			log_error("cannot add protected network: %s",
+	if (any_redirect_mode()) {
+		netns_fd = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
+		if (netns_fd < 0) {
+			log_error("cannot open current netns: %s",
 				  strerror(errno));
 			return -1;
 		}
-	}
+		g_sk_link = bpf_program__attach_netns(
+			g_skel->progs.shield_sk_lookup, netns_fd);
+		close(netns_fd);
+		if (!g_sk_link) {
+			log_error("cannot attach sk_lookup program: %s",
+				  strerror(errno));
+			return -1;
+		}
+		log_info("attached sk_lookup to current network namespace");
 
-	map_fd = bpf_map__fd(g_skel->maps.proxy_socks);
-	if (map_fd < 0 ||
-	    bpf_map_update_elem(map_fd, &key, &listen_fd, BPF_ANY) != 0) {
-		log_error("cannot publish proxy socket to BPF: %s",
-			  strerror(errno));
-		return -1;
-	}
-
-	netns_fd = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
-	if (netns_fd < 0) {
-		log_error("cannot open current netns: %s", strerror(errno));
-		return -1;
-	}
-	g_sk_link = bpf_program__attach_netns(g_skel->progs.shield_sk_lookup,
-					      netns_fd);
-	close(netns_fd);
-	if (!g_sk_link) {
-		log_error("cannot attach sk_lookup program: %s",
-			  strerror(errno));
-		return -1;
-	}
-	log_info("attached sk_lookup to current network namespace");
-
-	if (g_cfg.local_redirect) {
-		g_cg_link = attach_cgroup_prog(g_skel->progs.shield_connect4,
-					       "/sys/fs/cgroup");
-		if (g_cg_link)
-			log_info("attached cgroup/connect4 to /sys/fs/cgroup");
-		else
-			log_warn("cgroup/connect4 not attached (%s); "
-				 "local clients may bypass redirect",
-				 strerror(errno));
+		if (g_cfg.local_redirect) {
+			g_cg_link = attach_cgroup_prog(
+				g_skel->progs.shield_connect4, "/sys/fs/cgroup");
+			if (g_cg_link)
+				log_info("attached cgroup/connect4 to "
+					 "/sys/fs/cgroup");
+			else
+				log_warn("cgroup/connect4 not attached (%s); "
+					 "local clients may bypass redirect",
+					 strerror(errno));
+		}
 	}
 
 	return 0;
 }
 
-static int prepare_nets(const char *upstream_ip_str, int upstream_ip_known)
+static int upstream_excluded_from_nets(const struct instance_cfg *inst,
+				       uint32_t ip)
+{
+	if (inst->same_port)
+		return 0;
+	if (inst->upstream.port != inst->protect_port)
+		return 0;
+	return inst->upstream_addr.sin_addr.s_addr == ip;
+}
+
+static int prepare_nets(void)
 {
 	struct ifaddrs *ifas = NULL;
 	struct ifaddrs *ifa;
 	int i;
-	int rc = -1;
+	int j;
 
 	if (g_net_count == 0) {
 		if (getifaddrs(&ifas) != 0) {
@@ -1169,6 +1372,7 @@ static int prepare_nets(const char *upstream_ip_str, int upstream_ip_known)
 		}
 		for (ifa = ifas; ifa; ifa = ifa->ifa_next) {
 			uint32_t ip;
+			int skip = 0;
 
 			if (!ifa->ifa_addr ||
 			    ifa->ifa_addr->sa_family != AF_INET)
@@ -1176,14 +1380,15 @@ static int prepare_nets(const char *upstream_ip_str, int upstream_ip_known)
 			ip = ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr;
 			if (ip == 0)
 				continue;
-			if (upstream_ip_known &&
-			    g_cfg.upstream.port == g_cfg.protect_port) {
-				struct in_addr up;
-				if (inet_pton(AF_INET, upstream_ip_str, &up) == 1 &&
-				    up.s_addr == ip)
-					continue;
+			for (j = 0; j < g_cfg.count; j++) {
+				if (upstream_excluded_from_nets(&g_cfg.inst[j],
+								ip)) {
+					skip = 1;
+					break;
+				}
 			}
-			add_net(ip, 32);
+			if (!skip)
+				add_net(ip, 32);
 		}
 		freeifaddrs(ifas);
 	}
@@ -1198,32 +1403,36 @@ static int prepare_nets(const char *upstream_ip_str, int upstream_ip_known)
 		log_info("protected network: %s/%d", ip, g_nets[i].prefix);
 	}
 
-	if (upstream_ip_known && g_cfg.upstream.port == g_cfg.protect_port) {
-		struct in_addr up;
+	for (i = 0; i < g_cfg.count; i++) {
+		struct instance_cfg *inst = &g_cfg.inst[i];
 
-		if (inet_pton(AF_INET, upstream_ip_str, &up) == 1 &&
-		    ip_in_nets(up.s_addr)) {
-			log_error("upstream %s:%d is inside a protected network; "
-				  "the proxy would loop into itself. Use a "
-				  "different upstream port or protected CIDR.",
-				  upstream_ip_str, g_cfg.upstream.port);
+		if (inst->same_port || inst->upstream.port != inst->protect_port)
+			continue;
+		if (ip_in_nets(inst->upstream_addr.sin_addr.s_addr)) {
+			log_error("instance #%d: upstream %s:%d is inside a "
+				  "protected network; the proxy would loop "
+				  "into itself. Use a different upstream "
+				  "port or protected CIDR.",
+				  i, inst->upstream.host,
+				  inst->upstream.port);
 			return -1;
 		}
 	}
 
-	rc = 0;
-	return rc;
+	return 0;
 }
 
 static void on_signal(int sig)
 {
 	if (sig == SIGUSR1)
 		g_want_stats = 1;
+	else if (sig == SIGCHLD)
+		g_child_event = 1;
 	else
 		g_stop = 1;
 }
 
-static void install_signals(void)
+static void install_parent_signals(void)
 {
 	struct sigaction sa;
 
@@ -1233,15 +1442,33 @@ static void install_signals(void)
 	sa.sa_flags = 0;
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGHUP, &sa, NULL);
 	sigaction(SIGUSR1, &sa, NULL);
+	sigaction(SIGCHLD, &sa, NULL);
 	signal(SIGPIPE, SIG_IGN);
 }
 
-static int wait_for_connections(int timeout_ms)
+static void install_child_signals(void)
+{
+	struct sigaction sa;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = on_signal;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGHUP, &sa, NULL);
+	sigaction(SIGUSR1, &sa, NULL);
+	signal(SIGCHLD, SIG_DFL);
+	signal(SIGPIPE, SIG_IGN);
+}
+
+static int wait_for_connections(struct instance_cfg *inst, int timeout_ms)
 {
 	int waited = 0;
 
-	while (__atomic_load_n(&g_active_conns, __ATOMIC_SEQ_CST) > 0) {
+	while (__atomic_load_n(&inst->active_conns, __ATOMIC_SEQ_CST) > 0) {
 		if (waited >= timeout_ms)
 			return -1;
 		usleep(10000);
@@ -1250,7 +1477,7 @@ static int wait_for_connections(int timeout_ms)
 	return 0;
 }
 
-static void accept_loop(int listen_fd)
+static void accept_loop(struct instance_cfg *inst)
 {
 	while (!g_stop) {
 		struct pollfd pfd;
@@ -1264,11 +1491,10 @@ static void accept_loop(int listen_fd)
 
 		if (g_want_stats) {
 			g_want_stats = 0;
-			print_bpf_stats();
-			print_pool_stats();
+			print_pool_stats(inst);
 		}
 
-		pfd.fd = listen_fd;
+		pfd.fd = inst->listen_fd;
 		pfd.events = POLLIN;
 		pfd.revents = 0;
 		rc = poll(&pfd, 1, 500);
@@ -1282,8 +1508,8 @@ static void accept_loop(int listen_fd)
 			continue;
 
 		peer_len = sizeof(peer);
-		fd = accept4(listen_fd, (struct sockaddr *)&peer, &peer_len,
-			     SOCK_CLOEXEC);
+		fd = accept4(inst->listen_fd, (struct sockaddr *)&peer,
+			     &peer_len, SOCK_CLOEXEC);
 		if (fd < 0) {
 			if (errno == EINTR || errno == EAGAIN ||
 			    errno == EWOULDBLOCK)
@@ -1292,10 +1518,10 @@ static void accept_loop(int listen_fd)
 			continue;
 		}
 
-		active = __atomic_add_fetch(&g_active_conns, 1,
+		active = __atomic_add_fetch(&inst->active_conns, 1,
 					    __ATOMIC_SEQ_CST);
 		if (active > g_cfg.max_conns) {
-			__atomic_sub_fetch(&g_active_conns, 1,
+			__atomic_sub_fetch(&inst->active_conns, 1,
 					   __ATOMIC_SEQ_CST);
 			log_warn("connection limit reached (%d), rejecting",
 				 g_cfg.max_conns);
@@ -1306,10 +1532,11 @@ static void accept_loop(int listen_fd)
 		arg = calloc(1, sizeof(*arg));
 		if (!arg) {
 			close(fd);
-			__atomic_sub_fetch(&g_active_conns, 1,
+			__atomic_sub_fetch(&inst->active_conns, 1,
 					   __ATOMIC_SEQ_CST);
 			continue;
 		}
+		arg->inst = inst;
 		arg->fd = fd;
 		arg->peer = peer;
 		arg->peer_len = peer_len;
@@ -1320,7 +1547,7 @@ static void accept_loop(int listen_fd)
 			log_error("pthread_create: %s", strerror(errno));
 			close(fd);
 			free(arg);
-			__atomic_sub_fetch(&g_active_conns, 1,
+			__atomic_sub_fetch(&inst->active_conns, 1,
 					   __ATOMIC_SEQ_CST);
 			continue;
 		}
@@ -1328,40 +1555,525 @@ static void accept_loop(int listen_fd)
 	}
 }
 
+static int worker_run(int idx)
+{
+	struct instance_cfg *inst = &g_cfg.inst[idx];
+	int j;
+	int rc = EXIT_FAILURE;
+
+	g_inst = inst;
+	snprintf(g_tag_buf, sizeof(g_tag_buf), "w%d:%d", idx,
+		 inst->listen_port);
+	g_tag = g_tag_buf;
+
+	/* 父进程异常退出时让子进程一起退出，避免留下孤儿转发进程 */
+	prctl(PR_SET_PDEATHSIG, SIGTERM);
+	if (getppid() == 1)
+		_exit(EXIT_FAILURE);
+
+	install_child_signals();
+
+	/* 子进程只保留自己的监听 socket，其他实例的 fd 由父进程继续持有 */
+	for (j = 0; j < g_cfg.count; j++) {
+		if (j == idx)
+			continue;
+		if (g_cfg.inst[j].listen_fd >= 0) {
+			close(g_cfg.inst[j].listen_fd);
+			g_cfg.inst[j].listen_fd = -1;
+		}
+	}
+
+	/* fork 之后重新取一次随机数，避免父子进程共享 DRBG 状态 */
+	RAND_poll();
+
+	if (tls_init(inst) != 0)
+		goto out;
+
+	if (g_inst->same_port)
+		log_info("ready: mTLS on original tcp/%d (%s:%d); eBPF "
+			 "moves the backend's bind() to %s:%d",
+			 inst->protect_port, g_cfg.listen_host,
+			 inst->listen_port, inst->upstream.host,
+			 inst->upstream.port);
+	else
+		log_info("ready: tcp/%d redirected via eBPF to mTLS %s:%d, "
+			 "upstream %s:%d",
+			 inst->protect_port, g_cfg.listen_host,
+			 inst->listen_port, inst->upstream.host,
+			 inst->upstream.port);
+
+	if (upstream_pool_start(inst) != 0)
+		log_warn("cannot start upstream connection pool; "
+			 "falling back to direct connects");
+
+	accept_loop(inst);
+	print_pool_stats(inst);
+
+	if (wait_for_connections(inst, (g_cfg.handshake_timeout + 5) * 1000) == 0)
+		upstream_pool_stop(inst);
+	else
+		log_warn("connections still active at shutdown; "
+			 "skipping upstream pool cleanup");
+
+	rc = EXIT_SUCCESS;
+
+out:
+	if (g_tls_ctx) {
+		SSL_CTX_free(g_tls_ctx);
+		g_tls_ctx = NULL;
+	}
+	if (inst->listen_fd >= 0) {
+		close(inst->listen_fd);
+		inst->listen_fd = -1;
+	}
+	return rc;
+}
+
+static int find_instance_by_pid(pid_t pid)
+{
+	int i;
+
+	for (i = 0; i < g_cfg.count; i++) {
+		if (g_cfg.inst[i].pid == pid)
+			return i;
+	}
+	return -1;
+}
+
+static void describe_status(int status, char *buf, size_t buflen)
+{
+	if (WIFEXITED(status))
+		snprintf(buf, buflen, "exit %d", WEXITSTATUS(status));
+	else if (WIFSIGNALED(status))
+		snprintf(buf, buflen, "signal %d", WTERMSIG(status));
+	else
+		snprintf(buf, buflen, "status 0x%x", status);
+}
+
+static void reap_children(void)
+{
+	/* 先清标志：清空之后新到的 SIGCHLD 会重新置位，不会丢事件 */
+	g_child_event = 0;
+
+	for (;;) {
+		int status;
+		pid_t pid = waitpid(-1, &status, WNOHANG);
+		struct instance_cfg *inst;
+		char st[64];
+		long long uptime;
+		int delay;
+		int idx;
+
+		if (pid <= 0)
+			break;
+
+		idx = find_instance_by_pid(pid);
+		if (idx < 0)
+			continue;
+
+		inst = &g_cfg.inst[idx];
+		inst->pid = 0;
+		if (g_stop)
+			continue;
+
+		describe_status(status, st, sizeof(st));
+		uptime = now_ms() - inst->started_at_ms;
+		if (uptime < 3000) {
+			delay = inst->restart_delay > 0 ?
+					inst->restart_delay * 2 : 1;
+			if (delay > 30)
+				delay = 30;
+		} else {
+			delay = 1;
+		}
+		inst->restart_delay = delay;
+		inst->restart_at_ms = now_ms() + (long long)delay * 1000;
+		log_warn("worker #%d pid=%d exited (%s); restart in %ds",
+			 idx, (int)pid, st, delay);
+	}
+}
+
+static int spawn_worker(int idx)
+{
+	struct instance_cfg *inst = &g_cfg.inst[idx];
+	pid_t pid;
+
+	pid = fork();
+	if (pid < 0) {
+		log_error("fork worker #%d: %s", idx, strerror(errno));
+		return -1;
+	}
+	if (pid == 0) {
+		int rc = worker_run(idx);
+
+		_exit(rc);
+	}
+
+	inst->pid = pid;
+	inst->started_at_ms = now_ms();
+	inst->restart_at_ms = 0;
+	log_info("worker #%d started pid=%d: listen tcp/%d, protect tcp/%d, "
+		 "upstream %s:%d, mode=%s",
+		 idx, (int)pid, inst->listen_port, inst->protect_port,
+		 inst->upstream.host, inst->upstream.port,
+		 inst->same_port ? "same-port" : "redirect");
+	return 0;
+}
+
+static void schedule_restarts(void)
+{
+	long long now = now_ms();
+	int i;
+
+	if (g_stop)
+		return;
+
+	for (i = 0; i < g_cfg.count; i++) {
+		struct instance_cfg *inst = &g_cfg.inst[i];
+
+		if (inst->pid > 0 || now < inst->restart_at_ms)
+			continue;
+		if (spawn_worker(i) != 0) {
+			int delay = inst->restart_delay > 0 ?
+					inst->restart_delay * 2 : 1;
+
+			if (delay > 30)
+				delay = 30;
+			inst->restart_delay = delay;
+			inst->restart_at_ms = now + (long long)delay * 1000;
+			log_error("cannot restart worker #%d; retry in %ds",
+				  i, delay);
+		}
+	}
+}
+
+static void forward_stats_request(void)
+{
+	int i;
+
+	for (i = 0; i < g_cfg.count; i++) {
+		if (g_cfg.inst[i].pid > 0)
+			kill(g_cfg.inst[i].pid, SIGUSR1);
+	}
+}
+
+static void print_workers(void)
+{
+	int i;
+
+	for (i = 0; i < g_cfg.count; i++) {
+		struct instance_cfg *inst = &g_cfg.inst[i];
+
+		log_info("#%d listen=tcp/%d protect=tcp/%d upstream=%s:%d "
+			 "mode=%s pid=%d state=%s",
+			 i, inst->listen_port, inst->protect_port,
+			 inst->upstream.host, inst->upstream.port,
+			 inst->same_port ? "same-port" : "redirect",
+			 (int)inst->pid, inst->pid > 0 ? "running" : "pending");
+	}
+}
+
+static void supervise(void)
+{
+	while (!g_stop) {
+		if (g_want_stats) {
+			g_want_stats = 0;
+			print_bpf_stats();
+			print_workers();
+			forward_stats_request();
+		}
+		if (g_child_event)
+			reap_children();
+		schedule_restarts();
+		if (g_stop)
+			break;
+		usleep(200000);
+	}
+}
+
+static void stop_workers(void)
+{
+	int i;
+	int alive;
+	long long deadline;
+
+	g_stop = 1;
+	for (i = 0; i < g_cfg.count; i++) {
+		if (g_cfg.inst[i].pid > 0)
+			kill(g_cfg.inst[i].pid, SIGTERM);
+	}
+
+	deadline = now_ms() + (long long)(g_cfg.handshake_timeout + 10) * 1000;
+	for (;;) {
+		reap_children();
+		alive = 0;
+		for (i = 0; i < g_cfg.count; i++) {
+			if (g_cfg.inst[i].pid > 0)
+				alive++;
+		}
+		if (!alive)
+			break;
+		if (now_ms() >= deadline) {
+			for (i = 0; i < g_cfg.count; i++) {
+				if (g_cfg.inst[i].pid > 0) {
+					log_warn("worker #%d did not stop in "
+						 "time; killing pid=%d", i,
+						 (int)g_cfg.inst[i].pid);
+					kill(g_cfg.inst[i].pid, SIGKILL);
+					waitpid(g_cfg.inst[i].pid, NULL, 0);
+					g_cfg.inst[i].pid = 0;
+				}
+			}
+			break;
+		}
+		usleep(50000);
+	}
+
+	/* 收掉可能残留的僵尸 */
+	while (waitpid(-1, NULL, WNOHANG) > 0)
+		;
+	for (i = 0; i < g_cfg.count; i++)
+		g_cfg.inst[i].pid = 0;
+}
+
+static int build_instances(void)
+{
+	int n = g_listen_count;
+	int i;
+	int j;
+
+	if (n <= 0) {
+		log_error("--listenport is required");
+		return -1;
+	}
+	if (n > MAX_INSTANCES) {
+		log_error("too many listen ports (max %d)", MAX_INSTANCES);
+		return -1;
+	}
+	if (g_upstream_count != n) {
+		log_error("--upstream needs %d entries (one per listen port), "
+			  "got %d", n, g_upstream_count);
+		return -1;
+	}
+	if (g_protect_count && g_protect_count != n) {
+		log_error("--protect_port needs %d entries (or omit it to reuse "
+			  "--listenport)", n);
+		return -1;
+	}
+	if (g_ca_count && g_ca_count != 1 && g_ca_count != n) {
+		log_error("--ca needs 1 or %d entries", n);
+		return -1;
+	}
+	if (g_cert_count && g_cert_count != 1 && g_cert_count != n) {
+		log_error("--cert needs 1 or %d entries", n);
+		return -1;
+	}
+	if (g_key_count && g_key_count != 1 && g_key_count != n) {
+		log_error("--key needs 1 or %d entries", n);
+		return -1;
+	}
+
+	memset(g_cfg.inst, 0, sizeof(g_cfg.inst));
+	g_cfg.count = n;
+
+	for (i = 0; i < n; i++) {
+		struct instance_cfg *inst = &g_cfg.inst[i];
+		const char *protect_item = NULL;
+
+		inst->index = i;
+		inst->listen_fd = -1;
+
+		if (parse_int(g_listen_items[i], 1, 65535,
+			      &inst->listen_port)) {
+			log_error("bad --listenport value: %s",
+				  g_listen_items[i]);
+			return -1;
+		}
+
+		if (g_protect_count == 0) {
+			inst->protect_port = inst->listen_port;
+		} else {
+			protect_item = g_protect_items[i];
+			if (parse_int(protect_item, 1, 65535,
+				      &inst->protect_port)) {
+				log_error("bad --protect_port value: %s",
+					  protect_item);
+				return -1;
+			}
+		}
+
+		if (parse_endpoint(g_upstream_items[i], &inst->upstream)) {
+			log_error("bad --upstream value: %s",
+				  g_upstream_items[i]);
+			return -1;
+		}
+
+		inst->ca_file = g_ca_count ?
+			(g_ca_count == 1 ? g_ca_items[0] : g_ca_items[i]) :
+			"certs/ca.crt";
+		inst->cert_file = g_cert_count ?
+			(g_cert_count == 1 ? g_cert_items[0] : g_cert_items[i]) :
+			"certs/server.crt";
+		inst->key_file = g_key_count ?
+			(g_key_count == 1 ? g_key_items[0] : g_key_items[i]) :
+			"certs/server.key";
+
+		if (resolve_ipv4(inst->upstream.host,
+				 &inst->upstream_addr.sin_addr) != 0) {
+			log_error("instance #%d: cannot resolve upstream host "
+				  "%s", i, inst->upstream.host);
+			return -1;
+		}
+		inst->upstream_addr.sin_family = AF_INET;
+		inst->upstream_addr.sin_port =
+			htons((uint16_t)inst->upstream.port);
+
+		inst->same_port = inst->listen_port == inst->protect_port;
+
+		if (inst->same_port &&
+		    inst->upstream.port == inst->protect_port) {
+			log_error("instance #%d: same-port mode needs an "
+				  "internal backend port; --upstream must not "
+				  "use tcp/%d", i, inst->protect_port);
+			return -1;
+		}
+		if (inst->same_port &&
+		    !is_local_ipv4(inst->upstream_addr.sin_addr.s_addr)) {
+			log_error("instance #%d: same-port mode requires "
+				  "--upstream to be a local address so the "
+				  "backend bind() can be moved there", i);
+			return -1;
+		}
+
+		for (j = 0; j < i; j++) {
+			if (g_cfg.inst[j].listen_port == inst->listen_port) {
+				log_error("duplicate listen port tcp/%d",
+					  inst->listen_port);
+				return -1;
+			}
+			if (g_cfg.inst[j].protect_port ==
+			    inst->protect_port) {
+				log_error("duplicate protect port tcp/%d",
+					  inst->protect_port);
+				return -1;
+			}
+		}
+	}
+
+	return 0;
+}
+
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-		"Usage: %s [options]\n"
+		"Usage: %s --listenport P1[,P2...] --upstream H1:P1[,H2:P2...] [options]\n"
 		"\n"
-		"  -l, --listen ADDR:PORT        mTLS listener (default 0.0.0.0:9000)\n"
-		"  -p, --protect-port PORT       original TCP port (default 9000)\n"
-		"  -u, --upstream ADDR:PORT      internal plain service (default 127.0.0.1:19000)\n"
-		"  -n, --protect-cidr CIDR       redirect mode: IP/CIDR to intercept\n"
-		"  -a, --ca FILE                 client CA bundle (default certs/ca.crt)\n"
-		"  -c, --cert FILE               server certificate (default certs/server.crt)\n"
-		"  -k, --key FILE                server private key (default certs/server.key)\n"
-		"  -C, --allow-cn CN             allowed client cert CN; repeatable\n"
-		"  -t, --handshake-timeout SEC   TLS handshake timeout (default 10)\n"
-		"  -m, --max-conns N             concurrent connection limit (default 512)\n"
-		"  -P, --pool-size N             pre-connected upstream pool (default 32, 0=off)\n"
-		"  -L, --no-local-redirect       skip cgroup/connect4 attach\n"
-		"  -v, --verbose                 verbose logging\n"
-		"  -h, --help                    show this help\n"
+		"List arguments are matched by index: item N of --listenport,\n"
+		"--protect_port, --upstream, --ca, --cert and --key all belong to\n"
+		"the same forwarding instance. One value for --ca/--cert/--key is\n"
+		"broadcast to every instance; --protect_port, when given, must have\n"
+		"one entry per instance.\n"
 		"\n"
-		"Default same-port mode: mTLS listens on --protect-port and eBPF\n"
-		"rewrites the backend's bind() for that port to --upstream, so the\n"
-		"plain service keeps its original configuration. Start mtls_shield\n"
-		"before the backend. If --listen differs from --protect-port, the\n"
-		"old redirect mode is used (sk_lookup + cgroup/connect4).\n",
-		prog);
+		"  -l, --listenport LIST       mTLS listen ports, comma separated\n"
+		"  -p, --protect_port LIST     original TCP ports (default: = --listenport)\n"
+		"  -u, --upstream LIST         plain upstream ADDR:PORT per index\n"
+		"  -H, --listen-host ADDR      listen address (default 0.0.0.0)\n"
+		"  -n, --protect-cidr CIDR     redirect mode: IP/CIDR to intercept\n"
+		"  -a, --ca LIST               client CA bundle per index\n"
+		"                              (default certs/ca.crt)\n"
+		"  -c, --cert LIST             server certificate per index\n"
+		"                              (default certs/server.crt)\n"
+		"  -k, --key LIST              server private key per index\n"
+		"                              (default certs/server.key)\n"
+		"  -C, --allow-cn CN           allowed client cert CN; repeatable\n"
+		"  -t, --handshake-timeout SEC TLS handshake timeout (default 10)\n"
+		"  -m, --max-conns N           per-process concurrent limit (default 512)\n"
+		"  -P, --pool-size N           per-process upstream pool (default 32, 0=off)\n"
+		"  -L, --no-local-redirect     skip cgroup/connect4 attach\n"
+		"  -v, --verbose               verbose logging\n"
+		"  -h, --help                  show this help\n"
+		"\n"
+		"The main process loads eBPF once, opens all listen sockets and\n"
+		"forks one forwarding process per port. It supervises and restarts\n"
+		"children that exit unexpectedly.\n"
+		"\n"
+		"Same-port mode is used when a listen port equals its protect port:\n"
+		"eBPF bind4 rewrites the backend's bind() to --upstream, so the\n"
+		"backend keeps its original configuration. Start mtls_shield before\n"
+		"the backend. If a listen port differs from its protect port, that\n"
+		"instance uses the redirect mode (sk_lookup + cgroup/connect4).\n"
+		"\n"
+		"Example:\n"
+		"  %s --listenport 9000,9443 \\\n"
+		"      --protect_port 9000,9443 \\\n"
+		"      --upstream 127.0.0.1:19000,127.0.0.1:19443 \\\n"
+		"      --ca certs/ca.crt --cert certs/server.crt \\\n"
+		"      --key certs/server.key\n",
+		prog, prog);
+}
+
+/*
+ * 允许 -listenport=9000,9001 这种单横线长参数写法：
+ * getopt_long 只认 --，这里先做一次规范化。
+ */
+static int normalize_argv(int *argc, char **argv)
+{
+	static const char *names[] = {
+		"listenport", "listen-port", "protect_port", "protect-port",
+		"upstream", "listen-host", "protect-cidr", "ca", "cert",
+		"key", "allow-cn", "handshake-timeout", "max-conns",
+		"pool-size", "no-local-redirect", "verbose", "help",
+	};
+	int i;
+
+	for (i = 1; i < *argc; i++) {
+		char *arg = argv[i];
+		char *eq;
+		size_t namelen;
+		size_t k;
+		int match = 0;
+
+		if (arg[0] != '-' || arg[1] == '-' || arg[1] == '\0')
+			continue;
+
+		eq = strchr(arg + 1, '=');
+		namelen = eq ? (size_t)(eq - (arg + 1)) : strlen(arg + 1);
+		if (namelen < 2)
+			continue;
+
+		for (k = 0; k < sizeof(names) / sizeof(names[0]); k++) {
+			if (strlen(names[k]) == namelen &&
+			    strncmp(arg + 1, names[k], namelen) == 0) {
+				match = 1;
+				break;
+			}
+		}
+		if (!match)
+			continue;
+
+		{
+			size_t len = strlen(arg);
+			char *fixed = malloc(len + 2);
+
+			if (!fixed)
+				return -1;
+			fixed[0] = '-';
+			memcpy(fixed + 1, arg, len + 1);
+			argv[i] = fixed;
+		}
+	}
+	return 0;
 }
 
 static int parse_args(int argc, char **argv)
 {
 	static const struct option options[] = {
-		{ "listen", required_argument, NULL, 'l' },
+		{ "listenport", required_argument, NULL, 'l' },
+		{ "listen-port", required_argument, NULL, 'l' },
+		{ "protect_port", required_argument, NULL, 'p' },
 		{ "protect-port", required_argument, NULL, 'p' },
 		{ "upstream", required_argument, NULL, 'u' },
+		{ "listen-host", required_argument, NULL, 'H' },
 		{ "protect-cidr", required_argument, NULL, 'n' },
 		{ "ca", required_argument, NULL, 'a' },
 		{ "cert", required_argument, NULL, 'c' },
@@ -1377,32 +2089,37 @@ static int parse_args(int argc, char **argv)
 	};
 	int opt;
 
-	while ((opt = getopt_long(argc, argv, "l:p:u:n:a:c:k:C:t:m:P:Lvh",
+	while ((opt = getopt_long(argc, argv, "l:p:u:H:n:a:c:k:C:t:m:P:Lvh",
 				  options, NULL)) != -1) {
 		switch (opt) {
 		case 'l':
-			if (parse_endpoint(optarg, &g_cfg.listen)) {
-				log_error("bad --listen value: %s", optarg);
+			if (parse_list_option(optarg, g_listen_items,
+					      &g_listen_count, MAX_INSTANCES,
+					      "--listenport"))
 				return -1;
-			}
 			break;
 		case 'p':
-			if (parse_int(optarg, 1, 65535, &g_cfg.protect_port)) {
-				log_error("bad --protect-port value: %s", optarg);
+			if (parse_list_option(optarg, g_protect_items,
+					      &g_protect_count, MAX_INSTANCES,
+					      "--protect_port"))
 				return -1;
-			}
 			break;
 		case 'u':
-			if (parse_endpoint(optarg, &g_cfg.upstream)) {
-				log_error("bad --upstream value: %s", optarg);
+			if (parse_list_option(optarg, g_upstream_items,
+					      &g_upstream_count, MAX_INSTANCES,
+					      "--upstream"))
 				return -1;
-			}
+			break;
+		case 'H':
+			snprintf(g_cfg.listen_host, sizeof(g_cfg.listen_host),
+				 "%s", optarg);
 			break;
 		case 'n': {
 			struct net_cidr net;
 
 			if (parse_cidr(optarg, &net)) {
-				log_error("bad --protect-cidr value: %s", optarg);
+				log_error("bad --protect-cidr value: %s",
+					  optarg);
 				return -1;
 			}
 			if (add_net(net.ip, net.prefix)) {
@@ -1412,13 +2129,20 @@ static int parse_args(int argc, char **argv)
 			break;
 		}
 		case 'a':
-			g_cfg.ca_file = optarg;
+			if (parse_list_option(optarg, g_ca_items, &g_ca_count,
+					      MAX_INSTANCES, "--ca"))
+				return -1;
 			break;
 		case 'c':
-			g_cfg.cert_file = optarg;
+			if (parse_list_option(optarg, g_cert_items,
+					      &g_cert_count, MAX_INSTANCES,
+					      "--cert"))
+				return -1;
 			break;
 		case 'k':
-			g_cfg.key_file = optarg;
+			if (parse_list_option(optarg, g_key_items, &g_key_count,
+					      MAX_INSTANCES, "--key"))
+				return -1;
 			break;
 		case 'C':
 			if (g_allow_cn_count >= MAX_ALLOW_CN) {
@@ -1467,86 +2191,77 @@ static int parse_args(int argc, char **argv)
 
 int main(int argc, char **argv)
 {
-	char upstream_ip[INET_ADDRSTRLEN] = "";
-	int upstream_ip_known = 0;
-	int listen_fd;
 	int rc = EXIT_FAILURE;
+	int i;
+
+	if (normalize_argv(&argc, argv) != 0) {
+		log_error("out of memory");
+		return EXIT_FAILURE;
+	}
+	if (parse_args(argc, argv) != 0)
+		return EXIT_FAILURE;
 
 	libbpf_set_print(libbpf_print_fn);
 
-	if (parse_args(argc, argv) != 0)
-		return EXIT_FAILURE;
 	if (geteuid() != 0)
 		log_warn("not running as root; BPF load may fail");
 
-	g_same_port = g_cfg.listen.port == g_cfg.protect_port;
-
-	if (resolve_ipv4(g_cfg.upstream.host, &g_upstream_addr.sin_addr) != 0) {
-		log_error("cannot resolve upstream host %s", g_cfg.upstream.host);
+	if (build_instances() != 0)
 		return EXIT_FAILURE;
+
+	if (tls_validate_all() != 0)
+		return EXIT_FAILURE;
+
+	if (any_redirect_mode()) {
+		if (g_net_count > 0)
+			log_info("--protect-cidr overrides auto-detected "
+				 "protected networks");
+		if (prepare_nets() != 0)
+			return EXIT_FAILURE;
+	} else if (g_net_count > 0) {
+		log_warn("--protect-cidr is ignored: no redirect-mode instance");
 	}
-	g_upstream_addr.sin_family = AF_INET;
-	g_upstream_addr.sin_port = htons((uint16_t)g_cfg.upstream.port);
-	inet_ntop(AF_INET, &g_upstream_addr.sin_addr, upstream_ip,
-		  sizeof(upstream_ip));
-	upstream_ip_known = 1;
 
-	if (g_same_port && g_cfg.upstream.port == g_cfg.protect_port) {
-		log_error("same-port mode needs an internal backend port; "
-			  "--upstream must not use tcp/%d",
-			  g_cfg.protect_port);
-		return EXIT_FAILURE;
+	if (bpf_load() != 0)
+		goto out;
+
+	/*
+	 * 先 bind 所有监听端口，再挂 bind4。否则子进程/父进程自己的
+	 * bind(原端口) 也会被 rewrite 到内部端口。
+	 */
+	for (i = 0; i < g_cfg.count; i++) {
+		g_cfg.inst[i].listen_fd = create_listener(&g_cfg.inst[i]);
+		if (g_cfg.inst[i].listen_fd < 0)
+			goto out;
 	}
-	if (g_same_port && !is_local_ipv4(g_upstream_addr.sin_addr.s_addr)) {
-		log_error("same-port mode requires --upstream to be a local "
-			  "address so the backend bind() can be moved there");
-		return EXIT_FAILURE;
+
+	if (bpf_configure() != 0)
+		goto out;
+	if (bpf_attach() != 0)
+		goto out;
+
+	install_parent_signals();
+
+	log_info("daemon ready: %d instance(s)", g_cfg.count);
+	print_workers();
+
+	for (i = 0; i < g_cfg.count; i++) {
+		if (spawn_worker(i) != 0) {
+			log_error("cannot start forwarding process for "
+				  "instance #%d", i);
+			g_stop = 1;
+			stop_workers();
+			goto out;
+		}
 	}
-	if (g_same_port && g_net_count > 0)
-		log_warn("--protect-cidr is ignored in same-port mode");
 
-	if (!g_same_port &&
-	    prepare_nets(upstream_ip, upstream_ip_known) != 0)
-		return EXIT_FAILURE;
-
-	if (tls_init() != 0)
-		return EXIT_FAILURE;
-
-	listen_fd = create_listener();
-	if (listen_fd < 0)
-		return EXIT_FAILURE;
-
-	if (bpf_setup(listen_fd) != 0)
-		goto out_listen;
-
-	if (upstream_pool_start() != 0)
-		log_warn("cannot start upstream connection pool; "
-			 "falling back to direct connects");
-
-	install_signals();
-
-	if (g_same_port)
-		log_info("ready: mTLS on original tcp/%d (%s:%d); eBPF will "
-			 "move the backend's bind() to %s:%d",
-			 g_cfg.protect_port, g_cfg.listen.host,
-			 g_cfg.listen.port, upstream_ip, g_cfg.upstream.port);
-	else
-		log_info("ready: tcp/%d redirected via eBPF to mTLS %s:%d, "
-			 "upstream %s:%d",
-			 g_cfg.protect_port, g_cfg.listen.host,
-			 g_cfg.listen.port, upstream_ip, g_cfg.upstream.port);
-
-	accept_loop(listen_fd);
+	supervise();
+	stop_workers();
 	print_bpf_stats();
-	print_pool_stats();
+	log_info("all forwarding processes stopped");
 	rc = EXIT_SUCCESS;
 
-	if (wait_for_connections((g_cfg.handshake_timeout + 10) * 1000) == 0)
-		upstream_pool_stop();
-	else
-		log_warn("connections still active at shutdown; "
-			 "skipping upstream pool cleanup");
-
+out:
 	if (g_bind_link) {
 		bpf_link__destroy(g_bind_link);
 		g_bind_link = NULL;
@@ -1559,16 +2274,15 @@ int main(int argc, char **argv)
 		bpf_link__destroy(g_sk_link);
 		g_sk_link = NULL;
 	}
-
-out_listen:
 	if (g_skel) {
 		mtls_shield_bpf__destroy(g_skel);
 		g_skel = NULL;
 	}
-	if (g_tls_ctx) {
-		SSL_CTX_free(g_tls_ctx);
-		g_tls_ctx = NULL;
+	for (i = 0; i < g_cfg.count; i++) {
+		if (g_cfg.inst[i].listen_fd >= 0) {
+			close(g_cfg.inst[i].listen_fd);
+			g_cfg.inst[i].listen_fd = -1;
+		}
 	}
-	close(listen_fd);
 	return rc;
 }

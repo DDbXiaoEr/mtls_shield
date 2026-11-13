@@ -59,8 +59,8 @@ setup_netns() {
 
 start_shield() {
 	"$ROOT/mtls_shield" \
-		--listen "0.0.0.0:$PORT" \
-		--protect-port "$PORT" \
+		--listenport "$PORT" \
+		--protect_port "$PORT" \
 		--upstream "$UPSTREAM_HOST:$BACKEND_PORT" \
 		--ca "$CERT_DIR/ca.crt" \
 		--cert "$CERT_DIR/server.crt" \
