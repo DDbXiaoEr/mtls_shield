@@ -445,6 +445,10 @@ sudo kill -USR1 <pid>
 - `sk_lookup_seen` / `port_match`：调试计数
 - upstream pool：连接池命中/未命中次数（`hits` / `misses`）
 
+BPF 统计通过 ringbuf 事件送到用户态累加（`BPF_MAP_TYPE_RINGBUF`，256 KiB），
+主进程在 supervise 循环里持续消费。ringbuf 满时事件会被丢弃，因此这些数值是
+“用户态观察到的事件数”，不是严格计数；正常连接速率下不会丢。
+
 ## upstream 连接池
 
 每个转发子进程各有一个预连接池，后台线程持续保持 `--pool-size` 条到该实例

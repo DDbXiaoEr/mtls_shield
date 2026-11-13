@@ -56,12 +56,24 @@ struct {
 	__type(value, __u32);
 } proxy_socks SEC(".maps");
 
+/*
+ * 统计事件通过 ringbuf 推给用户态累加。ringbuf 是单生产者/单消费者共享
+ * 缓冲区，不需要 per-CPU 副本，也不会像 perf buffer 那样每 CPU 一个环。
+ * 注意：缓冲区满时 bpf_ringbuf_reserve 会失败，这条事件被丢弃，
+ * 用户态统计因此是“观察到的事件数”，不是严格计数；对当前每个连接
+ * 才触发一次的事件量级来说足够。若要严格计数，应在 reserve 失败时
+ * 回退到一个小型 per-CPU 丢弃计数器。
+ */
+struct stat_event {
+	__u32 key;
+	__u32 pad;
+	__u64 ts;
+};
+
 struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, 8);
-	__type(key, __u32);
-	__type(value, __u64);
-} stats SEC(".maps");
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 256 * 1024);
+} stat_events SEC(".maps");
 
 enum stat_key {
 	STAT_SK_REDIRECT = 0,
@@ -71,14 +83,20 @@ enum stat_key {
 	STAT_SEEN = 4,
 	STAT_PORT_MATCH = 5,
 	STAT_BIND_REDIRECT = 6,
+	STAT_MAX = 7,
 };
 
 static __always_inline void stat_inc(__u32 key)
 {
-	__u64 *value = bpf_map_lookup_elem(&stats, &key);
+	struct stat_event *ev;
 
-	if (value)
-		__sync_fetch_and_add(value, 1);
+	ev = bpf_ringbuf_reserve(&stat_events, sizeof(*ev), 0);
+	if (!ev)
+		return;
+
+	ev->key = key;
+	ev->ts = bpf_ktime_get_ns();
+	bpf_ringbuf_submit(ev, 0);
 }
 
 static __always_inline int net_is_protected(__u32 ip)

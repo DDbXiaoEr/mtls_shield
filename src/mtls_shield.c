@@ -1123,14 +1123,73 @@ out:
 	return NULL;
 }
 
-static int bpf_stats_fd(void)
+/* 与 src/mtls_shield.bpf.c 中的 struct stat_event 保持一致 */
+struct stat_event {
+	uint32_t key;
+	uint32_t pad;
+	uint64_t ts;
+};
+
+/* 布局与 BPF 侧 enum stat_key 一致 */
+enum stat_key {
+	STAT_SK_REDIRECT = 0,
+	STAT_CONNECT_REDIRECT = 1,
+	STAT_NO_SOCKET = 2,
+	STAT_ASSIGN_ERROR = 3,
+	STAT_SEEN = 4,
+	STAT_PORT_MATCH = 5,
+	STAT_BIND_REDIRECT = 6,
+	STAT_MAX = 7,
+};
+
+static struct ring_buffer *g_stat_rb;
+static unsigned long long g_stat_counts[STAT_MAX];
+
+static int handle_stat_event(void *ctx, void *data, size_t len)
 {
-	return bpf_map__fd(g_skel->maps.stats);
+	const struct stat_event *ev = data;
+
+	if (len < sizeof(*ev))
+		return 0;
+	if (ev->key < STAT_MAX)
+		g_stat_counts[ev->key]++;
+	return 0;
+}
+
+/*
+ * 尽量把 ringbuf 里的事件消费完。ring_buffer__poll 返回消费的记录数，
+ * 0 表示已空，负值是 -errno（EINTR 等），继续下一轮即可。
+ */
+static void drain_stat_events(void)
+{
+	if (!g_stat_rb)
+		return;
+	while (ring_buffer__poll(g_stat_rb, 0) > 0)
+		;
+}
+
+static int bpf_stats_ringbuf_open(void)
+{
+	int fd;
+
+	fd = bpf_map__fd(g_skel->maps.stat_events);
+	if (fd < 0) {
+		log_error("cannot get stat ringbuf map fd");
+		return -1;
+	}
+
+	g_stat_rb = ring_buffer__new(fd, handle_stat_event, NULL, NULL);
+	if (!g_stat_rb) {
+		log_error("cannot create stat ring buffer: %s",
+			  strerror(errno));
+		return -1;
+	}
+	return 0;
 }
 
 static void print_bpf_stats(void)
 {
-	static const char *names[] = {
+	static const char *names[STAT_MAX] = {
 		"sk_lookup_redirect",
 		"connect_redirect",
 		"no_proxy_socket",
@@ -1139,41 +1198,22 @@ static void print_bpf_stats(void)
 		"port_match",
 		"bind_redirect",
 	};
-	uint64_t total[7] = { 0 };
-	int ncpu;
-	uint64_t *values;
-	uint32_t key;
+	unsigned long long total[STAT_MAX];
 	int i;
-	int fd;
 
 	if (!g_skel)
 		return;
-	ncpu = libbpf_num_possible_cpus();
-	if (ncpu <= 0)
-		return;
 
-	values = calloc((size_t)ncpu, sizeof(*values));
-	if (!values)
-		return;
-
-	fd = bpf_stats_fd();
-	for (key = 0; key < 7; key++) {
-		if (bpf_map_lookup_elem(fd, &key, values) != 0)
-			continue;
-		for (i = 0; i < ncpu; i++)
-			total[key] += values[i];
-	}
+	drain_stat_events();
+	for (i = 0; i < STAT_MAX; i++)
+		total[i] = g_stat_counts[i];
 
 	log_info("bpf stats: %s=%llu %s=%llu %s=%llu %s=%llu "
 		 "%s=%llu %s=%llu %s=%llu",
-		 names[0], (unsigned long long)total[0],
-		 names[1], (unsigned long long)total[1],
-		 names[2], (unsigned long long)total[2],
-		 names[3], (unsigned long long)total[3],
-		 names[4], (unsigned long long)total[4],
-		 names[5], (unsigned long long)total[5],
-		 names[6], (unsigned long long)total[6]);
-	free(values);
+		 names[0], total[0], names[1], total[1],
+		 names[2], total[2], names[3], total[3],
+		 names[4], total[4], names[5], total[5],
+		 names[6], total[6]);
 }
 
 static struct bpf_link *attach_cgroup_prog(struct bpf_program *prog,
@@ -1224,6 +1264,9 @@ static int bpf_load(void)
 		log_error("cannot load BPF programs: %s", strerror(errno));
 		return -1;
 	}
+
+	if (bpf_stats_ringbuf_open() != 0)
+		return -1;
 	return 0;
 }
 
@@ -1776,6 +1819,8 @@ static void print_workers(void)
 static void supervise(void)
 {
 	while (!g_stop) {
+		/* 持续消费 ringbuf，避免 256 KiB 缓冲区被高频事件填满 */
+		drain_stat_events();
 		if (g_want_stats) {
 			g_want_stats = 0;
 			print_bpf_stats();
@@ -2275,6 +2320,8 @@ out:
 		g_sk_link = NULL;
 	}
 	if (g_skel) {
+		ring_buffer__free(g_stat_rb);
+		g_stat_rb = NULL;
 		mtls_shield_bpf__destroy(g_skel);
 		g_skel = NULL;
 	}

@@ -478,6 +478,11 @@ Statistics:
 - `sk_lookup_seen` / `port_match`: debug counters
 - upstream pool: pool `hits` / `misses`
 
+BPF statistics are delivered to userspace as ring buffer events (`BPF_MAP_TYPE_RINGBUF`,
+256 KiB) and accumulated by the main process as it drains the buffer in the supervise loop.
+A full ring buffer drops events, so these are "events observed in userspace" rather than
+exact counters; at normal connection rates nothing is dropped.
+
 ## Upstream connection pool
 
 `src/mtls_shield.c` keeps a per-process pool of pre-connected sockets to that
