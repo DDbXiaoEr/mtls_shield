@@ -231,7 +231,7 @@ fi
 
 kill -USR1 "$SHIELD_PID" 2>/dev/null || true
 sleep 0.8
-grep "bpf stats" "$LOG" | tail -n 1 || true
+grep -A7 "bpf stats" "$LOG" | tail -n 8 || true
 grep "upstream pool" "$LOG" | tail -n 1 || true
 
 echo

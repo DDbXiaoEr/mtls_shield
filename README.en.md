@@ -443,7 +443,7 @@ sudo ./scripts/demo.sh
 | `-m, --max-conns N` | `512` | maximum concurrent connections per forwarding process |
 | `-P, --pool-size N` | `32` | upstream pool size per forwarding process; `0` disables |
 | `-L, --no-local-redirect` | off | do not attach `cgroup/connect4` in redirect mode |
-| `-v, --verbose` | off | print libbpf debug logs |
+| `-v, --verbose` | off | also log every mTLS connection plus libbpf debug output |
 | `-h, --help` | | help |
 
 List arguments are matched by index, for example:
@@ -483,6 +483,25 @@ BPF statistics are delivered to userspace as ring buffer events (`BPF_MAP_TYPE_R
 A full ring buffer drops events, so these are "events observed in userspace" rather than
 exact counters; at normal connection rates nothing is dropped.
 
+Logs go to stderr, one line per event, with a millisecond timestamp and a source tag
+(`main`, or `w<instance>:<listen port>`):
+
+```text
+2026-11-14 06:32:26.938 [main] INFO  daemon ready: 1 instance(s)
+2026-11-14 06:32:26.941 [w0:9444] INFO  worker #0 pid=1234 starting: take over tcp/9443, mTLS on 0.0.0.0:9444, forward to 127.0.0.1:19000 (redirect)
+2026-11-14 06:32:26.943 [w0:9444] INFO  ready: accepting mTLS connections
+2026-11-14 06:32:28.935 [w0:9444] ERROR TLS handshake from 10.0.0.9:50000 failed: error:0A0000C7:SSL routines::peer did not return a certificate
+```
+
+- `INFO`/`WARN`/`ERROR` are printed by default; `--verbose` adds `DEBUG` (every successful
+  connection plus libbpf details).
+- Levels are colored on a terminal and plain when redirected to a file or pipe, so `grep`
+  and log collectors see clean text.
+- Each line is written with a single `write(2)`, so the parent and its children can share one
+  log file without interleaving halves of lines.
+- Under overload, `connection limit reached` is logged at most once per second together with
+  the number of connections rejected in that second.
+
 ## Upstream connection pool
 
 `src/mtls_shield.c` keeps a per-process pool of pre-connected sockets to that
@@ -513,7 +532,7 @@ For high concurrency:
 - Optional `--allow-cn` provides a second layer of identity allowlisting.
 - Plaintext clients fail the handshake and cannot bypass mTLS.
 - eBPF forces the backend listen address to loopback, so the plaintext backend cannot be reached externally.
-- The proxy logs client addresses and certificate CNs, but never private keys or plaintext application data.
+- By default the proxy only logs startup, failed handshakes, reconnects and similar events; `--verbose` additionally logs each client address and certificate CN. Private keys and plaintext application data are never logged.
 
 ## Limitations
 

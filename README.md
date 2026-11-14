@@ -411,7 +411,7 @@ sudo ./scripts/demo.sh
 | `-m, --max-conns N` | `512` | 每个转发子进程的最大并发连接数 |
 | `-P, --pool-size N` | `32` | 每个转发子进程的 upstream 连接池大小；`0` 关闭 |
 | `-L, --no-local-redirect` | 关闭该开关 | redirect 模式下不挂 `cgroup/connect4` |
-| `-v, --verbose` | 关闭 | 打印 libbpf 调试日志 |
+| `-v, --verbose` | 关闭 | 额外打印每条 mTLS 连接和 libbpf 调试日志 |
 | `-h, --help` | | 帮助 |
 
 参数按数组下标对应，例如：
@@ -449,6 +449,20 @@ BPF 统计通过 ringbuf 事件送到用户态累加（`BPF_MAP_TYPE_RINGBUF`，
 主进程在 supervise 循环里持续消费。ringbuf 满时事件会被丢弃，因此这些数值是
 “用户态观察到的事件数”，不是严格计数；正常连接速率下不会丢。
 
+日志全部写到 stderr，每条一行、带毫秒时间戳和来源标签（`main` 或 `w<实例>:<监听端口>`）：
+
+```text
+2026-11-14 06:32:26.938 [main] INFO  daemon ready: 1 instance(s)
+2026-11-14 06:32:26.941 [w0:9444] INFO  worker #0 pid=1234 starting: take over tcp/9443, mTLS on 0.0.0.0:9444, forward to 127.0.0.1:19000 (redirect)
+2026-11-14 06:32:26.943 [w0:9444] INFO  ready: accepting mTLS connections
+2026-11-14 06:32:28.935 [w0:9444] ERROR TLS handshake from 10.0.0.9:50000 failed: error:0A0000C7:SSL routines::peer did not return a certificate
+```
+
+- 默认只输出 `INFO`/`WARN`/`ERROR`；`--verbose` 追加 `DEBUG`（每条成功连接、libbpf 细节）。
+- 终端上按级别着色，重定向到文件或管道时自动关闭颜色，便于 `grep`/日志采集。
+- 每条日志由一次 `write(2)` 写出，父进程和多个子进程同时写同一个日志文件也不会交错。
+- 过载时 `connection limit reached` 每秒最多一行，并带上这一秒内拒绝的连接数。
+
 ## upstream 连接池
 
 每个转发子进程各有一个预连接池，后台线程持续保持 `--pool-size` 条到该实例
@@ -474,7 +488,8 @@ BPF 统计通过 ringbuf 事件送到用户态累加（`BPF_MAP_TYPE_RINGBUF`，
 - 可选 `--allow-cn` 做第二层身份白名单。
 - 明文客户端会直接握手失败，无法绕过 mTLS。
 - eBPF 把后端监听地址强制改写到回环地址，外部无法直接访问明文后端。
-- 代理日志会记录客户端地址和证书 CN，但不会记录私钥或明文应用数据。
+- 默认只记录启动、连接失败、重连等关键事件；`--verbose` 会额外记录每个客户端的
+  地址和证书 CN。任何时候都不会记录私钥或明文应用数据。
 
 ## 限制
 

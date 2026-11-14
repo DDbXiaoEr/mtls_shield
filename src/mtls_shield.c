@@ -137,9 +137,6 @@ static struct app_config g_cfg = {
 	.verbose = 0,
 };
 
-/* 当前子进程正在服务的实例；父进程中为 NULL */
-static struct instance_cfg *g_inst;
-
 static struct net_cidr g_nets[MAX_NETS];
 static int g_net_count;
 static char *g_allow_cns[MAX_ALLOW_CN];
@@ -172,17 +169,64 @@ static int g_cert_count;
 static char *g_key_items[MAX_INSTANCES];
 static int g_key_count;
 
-static void log_msg(const char *level, const char *fmt, va_list ap)
-{
-	char ts[32];
-	struct tm tm;
-	time_t now = time(NULL);
+enum log_level {
+	LOG_DEBUG,
+	LOG_INFO,
+	LOG_WARN,
+	LOG_ERROR,
+};
 
-	localtime_r(&now, &tm);
-	strftime(ts, sizeof(ts), "%H:%M:%S", &tm);
-	fprintf(stderr, "[%s] [%s] %-5s ", ts, g_tag, level);
-	vfprintf(stderr, fmt, ap);
-	fputc('\n', stderr);
+/*
+ * 每条日志先拼进一个缓冲区再一次性写出：stderr 无缓冲，一次 fputs 就是一次
+ * write(2)，父进程和多个子进程同时写终端/日志文件时不会出现半行交错。
+ * 时间戳带日期和毫秒，方便事后对齐多个进程的日志。
+ */
+static void log_vwrite(enum log_level level, const char *fmt, va_list ap)
+{
+	static const char *names[] = { "DEBUG", "INFO", "WARN", "ERROR" };
+	static const char *colors[] = {
+		"\033[90m", "", "\033[33m", "\033[1;31m",
+	};
+	static const char *color_ends[] = {
+		"\033[0m", "", "\033[0m", "\033[0m",
+	};
+	static const char *dim = "\033[2m";
+	static const char *reset = "\033[0m";
+	char ts[48];
+	char msg[1024];
+	char line[1200];
+	struct timespec now;
+	struct tm tm;
+	size_t len;
+
+	if (level == LOG_DEBUG && !g_cfg.verbose)
+		return;
+
+	clock_gettime(CLOCK_REALTIME, &now);
+	localtime_r(&now.tv_sec, &tm);
+	len = strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm);
+	snprintf(ts + len, sizeof(ts) - len, ".%03ld",
+		 (long)(now.tv_nsec / 1000000));
+
+	vsnprintf(msg, sizeof(msg), fmt, ap);
+
+	if (isatty(STDERR_FILENO))
+		snprintf(line, sizeof(line), "%s%s%s %s[%s]%s %s%-5s%s %s\n",
+			 dim, ts, reset, dim, g_tag, reset,
+			 colors[level], names[level], color_ends[level], msg);
+	else
+		snprintf(line, sizeof(line), "%s [%s] %-5s %s\n",
+			 ts, g_tag, names[level], msg);
+	fputs(line, stderr);
+}
+
+static void log_debug(const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	log_vwrite(LOG_DEBUG, fmt, ap);
+	va_end(ap);
 }
 
 static void log_info(const char *fmt, ...)
@@ -190,7 +234,7 @@ static void log_info(const char *fmt, ...)
 	va_list ap;
 
 	va_start(ap, fmt);
-	log_msg("INFO", fmt, ap);
+	log_vwrite(LOG_INFO, fmt, ap);
 	va_end(ap);
 }
 
@@ -199,7 +243,7 @@ static void log_warn(const char *fmt, ...)
 	va_list ap;
 
 	va_start(ap, fmt);
-	log_msg("WARN", fmt, ap);
+	log_vwrite(LOG_WARN, fmt, ap);
 	va_end(ap);
 }
 
@@ -208,7 +252,7 @@ static void log_error(const char *fmt, ...)
 	va_list ap;
 
 	va_start(ap, fmt);
-	log_msg("ERROR", fmt, ap);
+	log_vwrite(LOG_ERROR, fmt, ap);
 	va_end(ap);
 }
 
@@ -223,12 +267,37 @@ static const char *ssl_error_string(void)
 	return buf;
 }
 
+/*
+ * libbpf 在默认等级下会打印几十行 ELF/relo 过程信息，默认只保留它的告警，
+ * 其余（INFO/DEBUG）留给 --verbose，输出格式与本程序日志保持一致。
+ */
 static int libbpf_print_fn(enum libbpf_print_level level, const char *format,
 			   va_list args)
 {
+	char msg[512];
+	char *end;
+	size_t len;
+
 	if (level == LIBBPF_DEBUG && !g_cfg.verbose)
 		return 0;
-	return vfprintf(stderr, format, args);
+
+	vsnprintf(msg, sizeof(msg), format, args);
+	len = strlen(msg);
+	end = msg + len;
+	while (end > msg && (end[-1] == '\n' || end[-1] == '\r'))
+		*--end = '\0';
+	if (msg[0]) {
+		const char *body = msg;
+
+		/* libbpf 自己的消息已经带 "libbpf: " 前缀，别重复加 */
+		if (strncmp(body, "libbpf: ", 8) == 0)
+			body += 8;
+		if (level == LIBBPF_WARN)
+			log_warn("libbpf: %s", body);
+		else
+			log_debug("libbpf: %s", body);
+	}
+	return (int)len;
 }
 
 static long long now_ms(void)
@@ -1104,9 +1173,9 @@ static void *conn_thread(void *opaque)
 		goto out;
 	}
 
-	log_info("mTLS ok client=%s cn=%s local=%s upstream=%s:%d",
-		 arg->peer_str, cn, local_str, inst->upstream.host,
-		 inst->upstream.port);
+	log_debug("mTLS ok client=%s cn=%s local=%s upstream=%s:%d",
+		  arg->peer_str, cn, local_str, inst->upstream.host,
+		  inst->upstream.port);
 
 	relay_loop(ssl, fd, ufd);
 
@@ -1187,6 +1256,24 @@ static int bpf_stats_ringbuf_open(void)
 	return 0;
 }
 
+/* 追加到定长缓冲区；空间不足时静默丢弃后续内容，避免截断计算越界 */
+static size_t buf_append(char *buf, size_t size, size_t off, const char *fmt,
+			 ...)
+{
+	va_list ap;
+	int n;
+
+	if (off >= size)
+		return size;
+	va_start(ap, fmt);
+	n = vsnprintf(buf + off, size - off, fmt, ap);
+	va_end(ap);
+	if (n < 0)
+		return size;
+	off += (size_t)n;
+	return off > size ? size : off;
+}
+
 static void print_bpf_stats(void)
 {
 	static const char *names[STAT_MAX] = {
@@ -1198,22 +1285,20 @@ static void print_bpf_stats(void)
 		"port_match",
 		"bind_redirect",
 	};
-	unsigned long long total[STAT_MAX];
+	char buf[768];
+	size_t off = 0;
 	int i;
 
 	if (!g_skel)
 		return;
 
 	drain_stat_events();
-	for (i = 0; i < STAT_MAX; i++)
-		total[i] = g_stat_counts[i];
 
-	log_info("bpf stats: %s=%llu %s=%llu %s=%llu %s=%llu "
-		 "%s=%llu %s=%llu %s=%llu",
-		 names[0], total[0], names[1], total[1],
-		 names[2], total[2], names[3], total[3],
-		 names[4], total[4], names[5], total[5],
-		 names[6], total[6]);
+	off = buf_append(buf, sizeof(buf), off, "bpf stats:");
+	for (i = 0; i < STAT_MAX; i++)
+		off = buf_append(buf, sizeof(buf), off, "\n  %-18s %llu",
+				 names[i], g_stat_counts[i]);
+	log_info("%s", buf);
 }
 
 static struct bpf_link *attach_cgroup_prog(struct bpf_program *prog,
@@ -1439,11 +1524,19 @@ static int prepare_nets(void)
 	if (g_net_count == 0)
 		add_net(htonl(INADDR_LOOPBACK), 32);
 
-	for (i = 0; i < g_net_count; i++) {
-		char ip[INET_ADDRSTRLEN];
+	{
+		char buf[4096];
+		size_t off = 0;
 
-		inet_ntop(AF_INET, &g_nets[i].ip, ip, sizeof(ip));
-		log_info("protected network: %s/%d", ip, g_nets[i].prefix);
+		off = buf_append(buf, sizeof(buf), off, "protected networks:");
+		for (i = 0; i < g_net_count; i++) {
+			char ip[INET_ADDRSTRLEN];
+
+			inet_ntop(AF_INET, &g_nets[i].ip, ip, sizeof(ip));
+			off = buf_append(buf, sizeof(buf), off, "\n  %s/%d",
+					 ip, g_nets[i].prefix);
+		}
+		log_info("%s", buf);
 	}
 
 	for (i = 0; i < g_cfg.count; i++) {
@@ -1522,12 +1615,16 @@ static int wait_for_connections(struct instance_cfg *inst, int timeout_ms)
 
 static void accept_loop(struct instance_cfg *inst)
 {
+	long long limit_logged_ms = 0;
+	unsigned long limit_dropped = 0;
+
 	while (!g_stop) {
 		struct pollfd pfd;
 		struct sockaddr_storage peer;
 		socklen_t peer_len;
 		struct conn_arg *arg;
 		pthread_t thread;
+		long long now;
 		int fd;
 		int rc;
 		int active;
@@ -1566,8 +1663,20 @@ static void accept_loop(struct instance_cfg *inst)
 		if (active > g_cfg.max_conns) {
 			__atomic_sub_fetch(&inst->active_conns, 1,
 					   __ATOMIC_SEQ_CST);
-			log_warn("connection limit reached (%d), rejecting",
-				 g_cfg.max_conns);
+			/*
+			 * 过载时每个被拒连接都打一行会把终端刷爆，改成
+			 * 每秒最多一条并带上这段时间内丢掉的数量。
+			 */
+			limit_dropped++;
+			now = now_ms();
+			if (now - limit_logged_ms >= 1000) {
+				log_warn("connection limit reached (%d); "
+					 "rejected %lu connection(s) in the "
+					 "last second",
+					 g_cfg.max_conns, limit_dropped);
+				limit_dropped = 0;
+				limit_logged_ms = now;
+			}
 			close(fd);
 			continue;
 		}
@@ -1604,7 +1713,6 @@ static int worker_run(int idx)
 	int j;
 	int rc = EXIT_FAILURE;
 
-	g_inst = inst;
 	snprintf(g_tag_buf, sizeof(g_tag_buf), "w%d:%d", idx,
 		 inst->listen_port);
 	g_tag = g_tag_buf;
@@ -1615,6 +1723,24 @@ static int worker_run(int idx)
 		_exit(EXIT_FAILURE);
 
 	install_child_signals();
+
+	/*
+	 * 子进程一启动就把自己接管的端口和转发的上游打出来：即使后面 TLS
+	 * 初始化失败直接退出，日志里也能立刻看出是哪个实例、转发到哪里。
+	 */
+	if (inst->same_port)
+		log_info("worker #%d pid=%d starting: take over tcp/%d on "
+			 "%s:%d, forward to %s:%d (same-port, backend bind() "
+			 "is rewritten)",
+			 idx, (int)getpid(), inst->protect_port,
+			 g_cfg.listen_host, inst->listen_port,
+			 inst->upstream.host, inst->upstream.port);
+	else
+		log_info("worker #%d pid=%d starting: take over tcp/%d, mTLS "
+			 "on %s:%d, forward to %s:%d (redirect)",
+			 idx, (int)getpid(), inst->protect_port,
+			 g_cfg.listen_host, inst->listen_port,
+			 inst->upstream.host, inst->upstream.port);
 
 	/* 子进程只保留自己的监听 socket，其他实例的 fd 由父进程继续持有 */
 	for (j = 0; j < g_cfg.count; j++) {
@@ -1632,25 +1758,14 @@ static int worker_run(int idx)
 	if (tls_init(inst) != 0)
 		goto out;
 
-	if (g_inst->same_port)
-		log_info("ready: mTLS on original tcp/%d (%s:%d); eBPF "
-			 "moves the backend's bind() to %s:%d",
-			 inst->protect_port, g_cfg.listen_host,
-			 inst->listen_port, inst->upstream.host,
-			 inst->upstream.port);
-	else
-		log_info("ready: tcp/%d redirected via eBPF to mTLS %s:%d, "
-			 "upstream %s:%d",
-			 inst->protect_port, g_cfg.listen_host,
-			 inst->listen_port, inst->upstream.host,
-			 inst->upstream.port);
+	/* 端口和上游在上面已经打过，这里只表示 TLS 就绪、可以接连接了 */
+	log_info("ready: accepting mTLS connections");
 
 	if (upstream_pool_start(inst) != 0)
 		log_warn("cannot start upstream connection pool; "
 			 "falling back to direct connects");
 
 	accept_loop(inst);
-	print_pool_stats(inst);
 
 	if (wait_for_connections(inst, (g_cfg.handshake_timeout + 5) * 1000) == 0)
 		upstream_pool_stop(inst);
@@ -1755,11 +1870,7 @@ static int spawn_worker(int idx)
 	inst->pid = pid;
 	inst->started_at_ms = now_ms();
 	inst->restart_at_ms = 0;
-	log_info("worker #%d started pid=%d: listen tcp/%d, protect tcp/%d, "
-		 "upstream %s:%d, mode=%s",
-		 idx, (int)pid, inst->listen_port, inst->protect_port,
-		 inst->upstream.host, inst->upstream.port,
-		 inst->same_port ? "same-port" : "redirect");
+	log_info("worker #%d started pid=%d", idx, (int)pid);
 	return 0;
 }
 
@@ -1802,18 +1913,30 @@ static void forward_stats_request(void)
 
 static void print_workers(void)
 {
+	/* 每条约 70 字符 + 最长 255 字符的 upstream 主机名 */
+	char buf[MAX_INSTANCES * 340];
+	size_t off = 0;
 	int i;
 
+	off = buf_append(buf, sizeof(buf), off, "workers:");
 	for (i = 0; i < g_cfg.count; i++) {
 		struct instance_cfg *inst = &g_cfg.inst[i];
+		char listen[16];
+		char protect[16];
 
-		log_info("#%d listen=tcp/%d protect=tcp/%d upstream=%s:%d "
-			 "mode=%s pid=%d state=%s",
-			 i, inst->listen_port, inst->protect_port,
-			 inst->upstream.host, inst->upstream.port,
-			 inst->same_port ? "same-port" : "redirect",
-			 (int)inst->pid, inst->pid > 0 ? "running" : "pending");
+		snprintf(listen, sizeof(listen), "tcp/%d", inst->listen_port);
+		snprintf(protect, sizeof(protect), "tcp/%d",
+			 inst->protect_port);
+		off = buf_append(
+			buf, sizeof(buf), off,
+			"\n  #%-2d %-12s -> %s:%d  protect=%-12s mode=%-9s "
+			"pid=%-6d %s",
+			i, listen, inst->upstream.host, inst->upstream.port,
+			protect,
+			inst->same_port ? "same-port" : "redirect",
+			(int)inst->pid, inst->pid > 0 ? "running" : "pending");
 	}
+	log_info("%s", buf);
 }
 
 static void supervise(void)
@@ -2035,7 +2158,8 @@ static void usage(const char *prog)
 		"  -m, --max-conns N           per-process concurrent limit (default 512)\n"
 		"  -P, --pool-size N           per-process upstream pool (default 32, 0=off)\n"
 		"  -L, --no-local-redirect     skip cgroup/connect4 attach\n"
-		"  -v, --verbose               verbose logging\n"
+		"  -v, --verbose               log every mTLS connection and libbpf "
+		"debug output\n"
 		"  -h, --help                  show this help\n"
 		"\n"
 		"The main process loads eBPF once, opens all listen sockets and\n"
@@ -2288,7 +2412,6 @@ int main(int argc, char **argv)
 	install_parent_signals();
 
 	log_info("daemon ready: %d instance(s)", g_cfg.count);
-	print_workers();
 
 	for (i = 0; i < g_cfg.count; i++) {
 		if (spawn_worker(i) != 0) {
