@@ -303,7 +303,8 @@ int shield_sk_lookup(struct bpf_sk_lookup *ctx)
  * =====================================================================================
  * 程序 2：SEC("cgroup/bind4") —— 本项目的核心！透明改写后端的 bind()
  * -------------------------------------------------------------------------------------
- * 挂载点：cgroup（这里用 /sys/fs/cgroup 根 cgroup）。任何进程在该 cgroup 里
+ * 挂载点：cgroup（这里用 /sys/fs/cgroup 根 cgroup；实际程序可用
+ * --bind-cgroup 指定后端专属 cgroup）。任何进程在该 cgroup 及其后代里
  * 调用 bind(2) 绑 IPv4 地址时，内核都会先执行这个程序。
  *
  * 工作原理：ctx 是 struct bpf_sock_addr *，它就是【内核里正准备使用的
@@ -1090,7 +1091,8 @@ static int bpf_setup(int listen_fd)
 		 * 同端口模式只需要挂 bind4 一个程序！
 		 * 挂到 /sys/fs/cgroup 根 cgroup —— 意味着【系统上所有进程】的 bind
 		 * 都会过这个程序（好在逻辑只改写 protect_port，其他一律放行）。
-		 * 生产环境更严谨的做法：为后端进程建独立 cgroup，只挂到那里。
+		 * 生产环境更严谨的做法：为后端进程建独立 cgroup，只挂到那里
+		 * （实际程序用 --bind-cgroup 传入该路径）。
 		 */
 		g_bind_link = attach_cgroup_prog(g_skel->progs.shield_bind4,
 						 "/sys/fs/cgroup");

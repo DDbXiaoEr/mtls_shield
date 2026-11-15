@@ -117,6 +117,8 @@ struct app_config {
 	int max_conns;
 	int pool_size;
 	int local_redirect;
+	const char *bind_cgroup;
+	const char *connect_cgroup;
 	int verbose;
 };
 
@@ -134,6 +136,8 @@ static struct app_config g_cfg = {
 	.max_conns = 512,
 	.pool_size = 32,
 	.local_redirect = 1,
+	.bind_cgroup = "/sys/fs/cgroup",
+	.connect_cgroup = "/sys/fs/cgroup",
 	.verbose = 0,
 };
 
@@ -1315,6 +1319,27 @@ static struct bpf_link *attach_cgroup_prog(struct bpf_program *prog,
 	return link;
 }
 
+static int validate_cgroup_dir(const char *path, const char *opt, int fatal)
+{
+	struct stat st;
+
+	if (stat(path, &st) != 0) {
+		if (fatal)
+			log_error("%s %s: %s", opt, path, strerror(errno));
+		else
+			log_warn("%s %s: %s", opt, path, strerror(errno));
+		return -1;
+	}
+	if (!S_ISDIR(st.st_mode)) {
+		if (fatal)
+			log_error("%s %s: not a directory", opt, path);
+		else
+			log_warn("%s %s: not a directory", opt, path);
+		return -1;
+	}
+	return 0;
+}
+
 static int any_same_port(void)
 {
 	int i;
@@ -1433,14 +1458,17 @@ static int bpf_attach(void)
 	int netns_fd;
 
 	if (any_same_port()) {
+		if (validate_cgroup_dir(g_cfg.bind_cgroup, "--bind-cgroup", 1))
+			return -1;
 		g_bind_link = attach_cgroup_prog(g_skel->progs.shield_bind4,
-						 "/sys/fs/cgroup");
+						 g_cfg.bind_cgroup);
 		if (!g_bind_link) {
-			log_error("cannot attach cgroup/bind4: %s",
-				  strerror(errno));
+			log_error("cannot attach cgroup/bind4 to %s: %s",
+				  g_cfg.bind_cgroup, strerror(errno));
 			return -1;
 		}
-		log_info("attached cgroup/bind4 for same-port instances");
+		log_info("attached cgroup/bind4 to %s for same-port instances",
+			 g_cfg.bind_cgroup);
 	}
 
 	if (any_redirect_mode()) {
@@ -1460,12 +1488,15 @@ static int bpf_attach(void)
 		}
 		log_info("attached sk_lookup to current network namespace");
 
-		if (g_cfg.local_redirect) {
+		if (g_cfg.local_redirect &&
+		    validate_cgroup_dir(g_cfg.connect_cgroup,
+					"--connect-cgroup", 0) == 0) {
 			g_cg_link = attach_cgroup_prog(
-				g_skel->progs.shield_connect4, "/sys/fs/cgroup");
+				g_skel->progs.shield_connect4,
+				g_cfg.connect_cgroup);
 			if (g_cg_link)
-				log_info("attached cgroup/connect4 to "
-					 "/sys/fs/cgroup");
+				log_info("attached cgroup/connect4 to %s",
+					 g_cfg.connect_cgroup);
 			else
 				log_warn("cgroup/connect4 not attached (%s); "
 					 "local clients may bypass redirect",
@@ -2158,6 +2189,10 @@ static void usage(const char *prog)
 		"  -m, --max-conns N           per-process concurrent limit (default 512)\n"
 		"  -P, --pool-size N           per-process upstream pool (default 32, 0=off)\n"
 		"  -L, --no-local-redirect     skip cgroup/connect4 attach\n"
+		"      --bind-cgroup PATH      cgroup to attach cgroup/bind4 to\n"
+		"                              (default /sys/fs/cgroup)\n"
+		"      --connect-cgroup PATH   cgroup to attach cgroup/connect4 to\n"
+		"                              (default /sys/fs/cgroup)\n"
 		"  -v, --verbose               log every mTLS connection and libbpf "
 		"debug output\n"
 		"  -h, --help                  show this help\n"
@@ -2191,7 +2226,8 @@ static int normalize_argv(int *argc, char **argv)
 		"listenport", "listen-port", "protect_port", "protect-port",
 		"upstream", "listen-host", "protect-cidr", "ca", "cert",
 		"key", "allow-cn", "handshake-timeout", "max-conns",
-		"pool-size", "no-local-redirect", "verbose", "help",
+		"pool-size", "no-local-redirect", "bind-cgroup",
+		"connect-cgroup", "verbose", "help",
 	};
 	int i;
 
@@ -2234,6 +2270,11 @@ static int normalize_argv(int *argc, char **argv)
 	return 0;
 }
 
+enum {
+	OPT_BIND_CGROUP = 1000,
+	OPT_CONNECT_CGROUP,
+};
+
 static int parse_args(int argc, char **argv)
 {
 	static const struct option options[] = {
@@ -2252,6 +2293,8 @@ static int parse_args(int argc, char **argv)
 		{ "max-conns", required_argument, NULL, 'm' },
 		{ "pool-size", required_argument, NULL, 'P' },
 		{ "no-local-redirect", no_argument, NULL, 'L' },
+		{ "bind-cgroup", required_argument, NULL, OPT_BIND_CGROUP },
+		{ "connect-cgroup", required_argument, NULL, OPT_CONNECT_CGROUP },
 		{ "verbose", no_argument, NULL, 'v' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
@@ -2342,6 +2385,12 @@ static int parse_args(int argc, char **argv)
 			break;
 		case 'L':
 			g_cfg.local_redirect = 0;
+			break;
+		case OPT_BIND_CGROUP:
+			g_cfg.bind_cgroup = optarg;
+			break;
+		case OPT_CONNECT_CGROUP:
+			g_cfg.connect_cgroup = optarg;
 			break;
 		case 'v':
 			g_cfg.verbose = 1;

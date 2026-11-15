@@ -67,7 +67,8 @@ sudo ./mtls_shield \
 
 1. 主进程先 bind 所有监听端口，再加载一次 eBPF、写入按端口索引的配置，并给每个端口
    fork 一个转发子进程。
-2. 用户态把 `cgroup/bind4` 挂到 `/sys/fs/cgroup`。
+2. 用户态把 `cgroup/bind4` 挂到一个 cgroup（默认 `/sys/fs/cgroup`，可用
+   `--bind-cgroup` 收窄到后端专属 cgroup）。
 3. 后端按原配置 `bind(9000)`；`bind4` 在系统调用层把参数改成 `127.0.0.1:19000`，后端无感知。
 4. 对应的转发子进程把解密后的明文通过 `127.0.0.1:19000` 发给后端。
 
@@ -79,7 +80,8 @@ sudo ./mtls_shield \
 - 必须先启动 `mtls_shield`，再启动后端；否则后端会因 `EADDRINUSE` 启动失败。
 - 同端口实例的 `--upstream` 必须是本机地址，且端口不能等于该实例的 `--protect_port`。
 - `bind4` 只改写配置表里同端口实例的 `bind()`，其他端口（metrics、debug 等）不受影响；redirect 实例的 `bind()` 也不会被改写。
-- 当前代码把 `bind4` 挂在 `/sys/fs/cgroup` 根，覆盖所有后代 cgroup；生产环境建议挂到后端专属 cgroup 以缩小影响面。
+- `bind4` 默认挂在 `/sys/fs/cgroup` 根，覆盖所有后代 cgroup；生产环境建议用
+  `--bind-cgroup` 挂到后端专属 cgroup，避免其他进程的同端口 `bind()` 被改写，见下文。
 - 仅 IPv4；需要 cgroup v2、root、`CONFIG_CGROUP_BPF`。`bind4` 本身 4.17+ 可用，但 skeleton 会无条件加载 `sk_lookup`，所以实际仍要求 >= 5.9。
 - 没有任何 redirect 实例时，`--protect-cidr` 被忽略。
 - 后端调用 `getsockname()` 会看到内部端口 19000，处理方式见“限制”一节。
@@ -100,6 +102,43 @@ sudo ./mtls_shield \
 - 后端不在 `bind4` 生效的 cgroup 范围内。
 - 纯 IPv6 服务。
 - 服务需要多个进程同时绑同一端口，或有特殊的 `SO_REUSEPORT` 依赖。
+
+### 把 `bind4` 限定到后端专属 cgroup
+
+`bind4` 只改写配置表里 `--protect_port` 对应端口的 `bind()`，但挂载点是
+`/sys/fs/cgroup` 根时，同一台机器上其他 cgroup 里同样 `bind(9000)` 的进程也会被
+改写（例如别的租户或别的服务容器）。用 `--bind-cgroup` 收窄挂载点即可：
+
+```bash
+# 1. 给后端建一个专属 cgroup（cgroup v2 统一层级，root 权限）
+mkdir -p /sys/fs/cgroup/mtls-backend
+
+# 2. 先启动 shield，把 bind4 挂到该 cgroup
+sudo ./mtls_shield \
+  --listenport 9000 --protect_port 9000 --upstream 127.0.0.1:19000 \
+  --ca certs/ca.crt --cert certs/server.crt --key certs/server.key \
+  --bind-cgroup /sys/fs/cgroup/mtls-backend
+
+# 3. 后端在 bind() 之前进入该 cgroup
+echo "$BACKEND_PID" > /sys/fs/cgroup/mtls-backend/cgroup.procs
+# 或直接在 cgroup 内启动：
+#   sh -c 'echo $$ > /sys/fs/cgroup/mtls-backend/cgroup.procs; exec ./backend'
+```
+
+要点：
+
+- 程序对挂载的 cgroup **及其所有后代**生效；先挂载、后把后端移进来也可以，只要
+  后端还没执行 `bind()`。
+- 不要把 shield 自己（和它的转发子进程）放进这个 cgroup：接口/进程重启时需要重新
+  `bind()`，届时端口会被改写到内部端口。目标 cgroup 里只放后端进程树。
+- 路径必须在挂载时已存在、且是目录，否则启动直接报错。用 systemd 托管后端时，
+  可以直接指向它的 unit cgroup，例如
+  `/sys/fs/cgroup/system.slice/my-backend.service`。
+- `cgroup/bind4` 只在 cgroup v2 统一层级下可用；`--connect-cgroup` 同理只影响
+  redirect 模式的 `cgroup/connect4`，默认仍是 `/sys/fs/cgroup`（本机客户端可能
+  分布在任意 cgroup，通常不需要收窄）。
+- shield 退出时会自动卸载程序；有程序挂载期间 cgroup 目录不能 `rmdir`（`EBUSY`），
+  清理顺序应为先停 shield 再删 cgroup。
 
 同端口模式与 redirect 模式的对比：
 
@@ -411,6 +450,8 @@ sudo ./scripts/demo.sh
 | `-m, --max-conns N` | `512` | 每个转发子进程的最大并发连接数 |
 | `-P, --pool-size N` | `32` | 每个转发子进程的 upstream 连接池大小；`0` 关闭 |
 | `-L, --no-local-redirect` | 关闭该开关 | redirect 模式下不挂 `cgroup/connect4` |
+| `--bind-cgroup PATH` | `/sys/fs/cgroup` | `cgroup/bind4` 的挂载点；建议指向后端专属 cgroup |
+| `--connect-cgroup PATH` | `/sys/fs/cgroup` | `cgroup/connect4` 的挂载点 |
 | `-v, --verbose` | 关闭 | 额外打印每条 mTLS 连接和 libbpf 调试日志 |
 | `-h, --help` | | 帮助 |
 
@@ -504,8 +545,9 @@ BPF 统计通过 ringbuf 事件送到用户态累加（`BPF_MAP_TYPE_RINGBUF`，
   网段，否则代理连上游会死循环）。若必须保留同端口模式，可在用户态用 LD_PRELOAD
   重写 `getsockname()`，或在内核用 kretprobe + `bpf_probe_write_user` 改写返回值
   （本项目未实现）。
-- `cgroup/bind4` 挂在 `/sys/fs/cgroup`，会改写所有后续对原端口的 `bind()`。
-  生产环境建议把后端放进独立 cgroup，并把程序挂到该 cgroup 上。
+- `cgroup/bind4` 默认挂在 `/sys/fs/cgroup`，会改写该层级内所有后续对原端口的
+  `bind()`。生产环境建议把后端放进独立 cgroup，并用 `--bind-cgroup` 把程序挂到
+  该 cgroup 上。
 - mTLS 在代理处终结，代理到后端是回环明文。
 - 没有实现 SNI 路由、TLS 透传、CRL/OCSP。
 - 每个连接一个线程；upstream 连接池只减少建连开销，不改变线程模型。需要
@@ -521,6 +563,9 @@ BPF 统计通过 ringbuf 事件送到用户态累加（`BPF_MAP_TYPE_RINGBUF`，
 sudo bpftool link list
 sudo bpftool prog show name shield_bind4
 
+# 确认 bind4 挂在了预期的 cgroup（默认是 /sys/fs/cgroup 根）
+sudo bpftool cgroup tree /sys/fs/cgroup
+
 # 查看监听：9000 应该是 mtls_shield，19000 应该是原服务
 ss -ltnp | grep -E ':(9000|19000)'
 
@@ -532,8 +577,9 @@ tail -f demo.log
 
 - **启动报 `bind 0.0.0.0:9000: Address already in use`**：后端先启动了。
   先停后端，启动 `mtls_shield`，再启动后端。程序日志里也会给出这个提示。
-- **后端还在 9000**：确认 `ss` 显示后端在 19000；如果不在，说明 `bind4` 没挂上，
-  或后端启动早于 shield。
+- **后端还在 9000**：确认 `ss` 显示后端在 19000；如果不在，说明 `bind4` 没挂上、
+  后端启动早于 shield，或后端不在 `--bind-cgroup` 指定的 cgroup 内
+  （用 `cat /proc/<pid>/cgroup` 对照）。
 - **curl 报证书主机名不匹配**：生成证书时 `HOST_IP` 没包含访问用的 IP。
 - **远端访问不到**：确认 `--listen-host 0.0.0.0` 且防火墙放行对应端口。
 - **`--allow-cn` 不生效**：确认证书的 Subject CN 就是配置的值。

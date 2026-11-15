@@ -76,7 +76,8 @@ How it works:
 
 1. The main process binds all listen ports first, loads eBPF once, writes the per-port
    configuration, and forks one forwarding process per port.
-2. User space attaches `cgroup/bind4` to `/sys/fs/cgroup`.
+2. User space attaches `cgroup/bind4` to a cgroup (default `/sys/fs/cgroup`; use
+   `--bind-cgroup` to narrow it to a dedicated backend cgroup).
 3. The backend calls `bind(9000)` with its original configuration; `bind4` rewrites the arguments to `127.0.0.1:19000` at the syscall level. The backend is unaware.
 4. The forwarding process for that port sends decrypted plaintext to the backend over `127.0.0.1:19000`.
 
@@ -90,7 +91,7 @@ Requirements and constraints:
 - `mtls_shield` must start before the backend; otherwise the backend fails with `EADDRINUSE`.
 - For a same-port instance, `--upstream` must be a local address and its port must differ from that instance's `--protect_port`.
 - `bind4` only rewrites `bind()` calls for same-port entries in the configuration table; other ports (metrics, debug, etc.) are untouched. Redirect instances are not rewritten either.
-- The current code attaches `bind4` to the `/sys/fs/cgroup` root, which covers all descendant cgroups. In production, attach it to a dedicated backend cgroup to limit the blast radius.
+- `bind4` is attached to the `/sys/fs/cgroup` root by default, which covers all descendant cgroups. In production, use `--bind-cgroup` to attach it to a dedicated backend cgroup so that other processes binding the same port are not affected; see below.
 - IPv4 only; requires cgroup v2, root, and `CONFIG_CGROUP_BPF`. `bind4` itself needs 4.17+, but the skeleton unconditionally loads `sk_lookup`, so >= 5.9 is required in practice.
 - `--protect-cidr` is ignored when no instance uses redirect mode.
 - The backend's `getsockname()` sees the internal port 19000; see the Limitations section for workarounds.
@@ -111,6 +112,45 @@ When not to use it, or use with care:
 - The backend is outside the cgroup where `bind4` is effective.
 - IPv6-only services.
 - Services that need multiple processes to bind the same port, or have special `SO_REUSEPORT` dependencies.
+
+### Scoping `bind4` to a dedicated backend cgroup
+
+`bind4` only rewrites `bind()` for the `--protect_port` entries in the configuration table, but
+when attached to the `/sys/fs/cgroup` root, any process in any descendant cgroup that also calls
+`bind(9000)` is rewritten too (another tenant, another service container, ...). Use
+`--bind-cgroup` to narrow the attachment point:
+
+```bash
+# 1. Create a dedicated cgroup for the backend (cgroup v2 unified hierarchy, root)
+mkdir -p /sys/fs/cgroup/mtls-backend
+
+# 2. Start the shield first and attach bind4 to that cgroup
+sudo ./mtls_shield \
+  --listenport 9000 --protect_port 9000 --upstream 127.0.0.1:19000 \
+  --ca certs/ca.crt --cert certs/server.crt --key certs/server.key \
+  --bind-cgroup /sys/fs/cgroup/mtls-backend
+
+# 3. Move the backend into the cgroup before it calls bind()
+echo "$BACKEND_PID" > /sys/fs/cgroup/mtls-backend/cgroup.procs
+# or start it inside the cgroup:
+#   sh -c 'echo $$ > /sys/fs/cgroup/mtls-backend/cgroup.procs; exec ./backend'
+```
+
+Notes:
+
+- The program applies to the attached cgroup **and all its descendants**. Attaching first and
+  moving the backend in afterwards also works, as long as the backend has not called `bind()` yet.
+- Do not put the shield itself (or its forwarding children) into that cgroup: the process
+  `bind()`s again on restart, and the port would then be rewritten. Keep only the backend's
+  process tree in the target cgroup.
+- The path must already exist and be a directory when attaching, otherwise startup fails. When
+  the backend is managed by systemd you can point at its unit cgroup directly, e.g.
+  `/sys/fs/cgroup/system.slice/my-backend.service`.
+- `cgroup/bind4` requires the cgroup v2 unified hierarchy. `--connect-cgroup` does the same for
+  `cgroup/connect4` in redirect mode and still defaults to `/sys/fs/cgroup` (local clients can
+  live in any cgroup, so narrowing it is rarely desirable).
+- The shield detaches the programs on exit; a cgroup with a program attached cannot be removed
+  (`rmdir` returns `EBUSY`), so stop the shield before deleting the cgroup.
 
 Same-port mode vs redirect mode:
 
@@ -443,6 +483,8 @@ sudo ./scripts/demo.sh
 | `-m, --max-conns N` | `512` | maximum concurrent connections per forwarding process |
 | `-P, --pool-size N` | `32` | upstream pool size per forwarding process; `0` disables |
 | `-L, --no-local-redirect` | off | do not attach `cgroup/connect4` in redirect mode |
+| `--bind-cgroup PATH` | `/sys/fs/cgroup` | cgroup to attach `cgroup/bind4` to; point it at the backend's dedicated cgroup |
+| `--connect-cgroup PATH` | `/sys/fs/cgroup` | cgroup to attach `cgroup/connect4` to |
 | `-v, --verbose` | off | also log every mTLS connection plus libbpf debug output |
 | `-h, --help` | | help |
 
@@ -539,7 +581,9 @@ For high concurrency:
 - IPv4 only for now; IPv6 needs `cgroup/bind6` plus IPv6 maps/programs.
 - The shield must start before the service. Attaching eBPF after the service has started cannot retroactively rewrite a completed `bind()`.
 - In same-port mode the backend's `getsockname()` sees the real internal port 19000; `bind4` only rewrites the `bind()` arguments and cannot hide the kernel socket's actual binding. Services that advertise their listen port in responses or self-connect can use redirect mode instead: `--listenport 8443 --protect_port 9000 --upstream 127.0.0.1:9000`. In that mode `bind4` is not attached for that instance, the backend keeps listening on `0.0.0.0:9000`, and `getsockname()` returns the original value. The cost is an extra listening port, and local connections to `127.0.0.1:9000` bypass mTLS (the upstream address must not be inside a protected network, or the proxy would loop into itself). If same-port mode is required, rewrite `getsockname()` in user space with LD_PRELOAD, or rewrite the return value in the kernel with kretprobe + `bpf_probe_write_user` (not implemented here).
-- `cgroup/bind4` is attached to `/sys/fs/cgroup` and rewrites every subsequent `bind()` on the original port. In production, put the backend in its own cgroup and attach the program to that cgroup.
+- `cgroup/bind4` is attached to `/sys/fs/cgroup` by default and rewrites every subsequent
+  `bind()` on the original port within that hierarchy. In production, put the backend in its own
+  cgroup and attach the program to that cgroup with `--bind-cgroup`.
 - mTLS terminates at the proxy; the proxy-to-backend hop is plaintext over loopback.
 - No SNI routing, TLS passthrough, or CRL/OCSP.
 - One thread per connection; the upstream pool reduces connect overhead but does not change the threading model. For tens of thousands of connections, use an epoll event loop plus a thread pool.
@@ -554,6 +598,9 @@ For high concurrency:
 sudo bpftool link list
 sudo bpftool prog show name shield_bind4
 
+# Confirm bind4 is attached to the intended cgroup (default: /sys/fs/cgroup root)
+sudo bpftool cgroup tree /sys/fs/cgroup
+
 # Inspect listeners: 9000 should be mtls_shield, 19000 should be the original service
 ss -ltnp | grep -E ':(9000|19000)'
 
@@ -567,7 +614,8 @@ Common issues:
   Stop the backend, start `mtls_shield`, then start the backend again. The program log also
   prints this hint.
 - **The backend is still on 9000**: check that `ss` shows the backend on 19000; if not, `bind4`
-  was not attached, or the backend started before the shield.
+  was not attached, the backend started before the shield, or the backend is not in the cgroup
+  given by `--bind-cgroup` (compare with `cat /proc/<pid>/cgroup`).
 - **curl reports a certificate hostname mismatch**: `HOST_IP` did not include the IP used to
   connect when generating the certificates.
 - **Remote access fails**: make sure `--listen-host 0.0.0.0` and that the firewall allows the port.
