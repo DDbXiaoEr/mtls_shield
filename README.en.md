@@ -631,6 +631,13 @@ Common issues:
 - **The backend is still on 9000**: check that `ss` shows the backend on 19000; if not, `bind4`
   was not attached, the backend started before the shield, or the backend is not in the cgroup
   given by `--bind-cgroup` (compare with `cat /proc/<pid>/cgroup`).
+- **`EADDRINUSE` persists with `systemd-run --scope --unit=xxx`**: `--unit=` only names the
+  systemd unit; the process lands in `/sys/fs/cgroup/system.slice/xxx.scope`, not in the
+  directory given by `--bind-cgroup`, so `bind4` does not apply. To keep systemd resource
+  limits, align the scope with a slice: `sudo systemctl start testgroup.slice`, point the
+  shield at `/sys/fs/cgroup/testgroup.slice`, then start the backend with
+  `sudo systemd-run --scope --slice=testgroup.slice ...` (the scope becomes a child cgroup of
+  that slice). Alternatively write the PID into `cgroup.procs` manually as shown above.
 - **curl reports a certificate hostname mismatch**: `HOST_IP` did not include the IP used to
   connect when generating the certificates.
 - **Remote access fails**: make sure `--listen-host 0.0.0.0` and that the firewall allows the port.

@@ -595,6 +595,14 @@ tail -f demo.log
 - **后端还在 9000**：确认 `ss` 显示后端在 19000；如果不在，说明 `bind4` 没挂上、
   后端启动早于 shield，或后端不在 `--bind-cgroup` 指定的 cgroup 内
   （用 `cat /proc/<pid>/cgroup` 对照）。
+- **用 `systemd-run --scope --unit=xxx` 启动后端仍报 `EADDRINUSE`**：`--unit=` 只是
+  systemd 单元名，进程实际落在 `/sys/fs/cgroup/system.slice/xxx.scope`，并不在
+  `--bind-cgroup` 指定的目录里，所以 `bind4` 不生效。要保留 systemd 的资源限制，可以
+  用 slice 对齐范围：
+  `sudo systemctl start testgroup.slice`，让 shield 挂到
+  `/sys/fs/cgroup/testgroup.slice`，再用
+  `sudo systemd-run --scope --slice=testgroup.slice ...` 启动后端（scope 会成为该
+  slice 的子 cgroup）；或者按上文示例手动把 PID 写进 `cgroup.procs`。
 - **curl 报证书主机名不匹配**：生成证书时 `HOST_IP` 没包含访问用的 IP。
 - **远端访问不到**：确认 `--listen-host 0.0.0.0` 且防火墙放行对应端口。
 - **`--allow-cn` 不生效**：确认证书的 Subject CN 就是配置的值。
