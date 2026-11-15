@@ -53,15 +53,30 @@ TLS 握手、证书校验和明文转发。主进程不处理连接，只做监�
 ### 同端口模式（默认）
 
 当某个实例的 `--listenport` 等于它的 `--protect_port` 时，程序对该实例使用同端口模式。
-例如：
+完整流程示例（把 `bind4` 收窄到后端专属 cgroup，推荐）：
 
 ```bash
+# 1) 建一个只给后端用的 cgroup（cgroup v2 统一层级）
+sudo mkdir -p /sys/fs/cgroup/mtls-backend
+
+# 2) 先启动 shield：占用 9000，把后端的 bind(9000) 改写到 127.0.0.1:19000
 sudo ./mtls_shield \
   --listenport 9000 \
   --protect_port 9000 \
   --upstream 127.0.0.1:19000 \
-  --ca certs/ca.crt --cert certs/server.crt --key certs/server.key
+  --ca certs/ca.crt --cert certs/server.crt --key certs/server.key \
+  --bind-cgroup /sys/fs/cgroup/mtls-backend
+
+# 3) 后端必须在 shield 之后启动，并在 bind() 之前进入同一个 cgroup
+sudo sh -c 'echo $$ > /sys/fs/cgroup/mtls-backend/cgroup.procs; exec ./your-backend'
+
+# 4) 验证：9000 属于 mtls_shield，19000 属于后端
+ss -ltnp | grep -E ':(9000|19000)'
+cat /proc/"$(pgrep -x your-backend)"/cgroup
 ```
+
+不想收窄影响面时，去掉 `--bind-cgroup` 并跳过第 1、3 步的 cgroup 操作即可，后端照常
+直接启动（此时 `bind4` 挂在 `/sys/fs/cgroup` 根，所有后代 cgroup 都会生效）。
 
 工作流程：
 

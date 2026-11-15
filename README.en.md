@@ -62,15 +62,30 @@ same-port mode.
 ### Same-port mode (default)
 
 When an instance's `--listenport` equals its `--protect_port`, that instance uses same-port mode.
-For example:
+Complete flow (scoping `bind4` to a dedicated backend cgroup, recommended):
 
 ```bash
+# 1) Create a cgroup used only by the backend (cgroup v2 unified hierarchy)
+sudo mkdir -p /sys/fs/cgroup/mtls-backend
+
+# 2) Start the shield first: it owns 9000 and rewrites the backend's bind(9000) to 127.0.0.1:19000
 sudo ./mtls_shield \
   --listenport 9000 \
   --protect_port 9000 \
   --upstream 127.0.0.1:19000 \
-  --ca certs/ca.crt --cert certs/server.crt --key certs/server.key
+  --ca certs/ca.crt --cert certs/server.crt --key certs/server.key \
+  --bind-cgroup /sys/fs/cgroup/mtls-backend
+
+# 3) The backend must start after the shield and join the same cgroup before bind()
+sudo sh -c 'echo $$ > /sys/fs/cgroup/mtls-backend/cgroup.procs; exec ./your-backend'
+
+# 4) Verify: 9000 belongs to mtls_shield, 19000 belongs to the backend
+ss -ltnp | grep -E ':(9000|19000)'
+cat /proc/"$(pgrep -x your-backend)"/cgroup
 ```
+
+To skip the scoping, drop `--bind-cgroup` and the cgroup steps (1 and 3) and just start the
+backend normally (`bind4` then lives on the `/sys/fs/cgroup` root and affects all descendants).
 
 How it works:
 
